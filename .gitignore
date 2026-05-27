@@ -1,0 +1,14 @@
+# Never commit real credentials
+.env
+
+# Bot output files
+*.log
+trades.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
