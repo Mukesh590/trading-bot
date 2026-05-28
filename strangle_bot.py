@@ -132,6 +132,30 @@ _id_counter = 0
 # strangle may be opened on that ticker.  Set on every close (profit or stop).
 _ticker_cooldowns: Dict[str, datetime] = {}
 
+# ── CSP / wheel position trackers ─────────────────────────────────────────────
+# open_csps: csp_id -> dict
+#   ticker, put_symbol, put_strike, put_expiry, put_credit, contracts,
+#   vix_at_entry, opened_at, effective_cost_basis, collateral_reserved
+open_csps: Dict[str, dict] = {}
+
+# assigned_shares: ticker -> dict (at most one assignment per ticker at a time)
+#   ticker, shares, effective_cost_basis, assigned_at, source_csp_id
+assigned_shares: Dict[str, dict] = {}
+
+# open_covered_calls: cc_id -> dict
+#   ticker, call_symbol, call_strike, call_expiry, call_credit, contracts,
+#   opened_at, effective_cost_basis
+open_covered_calls: Dict[str, dict] = {}
+
+
+def _get_buying_power() -> float:
+    """Return current account buying power; returns 0.0 on error."""
+    try:
+        return float(trading_client.get_account().buying_power)
+    except Exception as exc:
+        logger.error("Could not fetch buying power: %s", exc)
+        return 0.0
+
 
 def _new_strangle_id(ticker: str) -> str:
     global _id_counter
@@ -515,57 +539,471 @@ def manage_positions() -> None:
             _close_strangle(sid, spread_value_now, put_price, f"PROFIT_TAKE_{profit_pct:.1%}")
 
 
+# ── CSP open / close ──────────────────────────────────────────────────────────
+
+def open_csp(ticker: str, vix: float) -> bool:
+    """
+    Sell a cash-secured put on `ticker` at CSP_OTM_PCT (5%) below spot.
+
+    Buying-power check is performed twice:
+      1. Against the approximate strike (spot * 0.95) before hitting the API.
+      2. Against the actual strike of the contract returned by the chain search.
+    Either failure aborts cleanly without submitting any order.
+    """
+    price = market_data.get_current_price(ticker, stock_data_client)
+    if price is None:
+        logger.warning("%s CSP: skipping — could not fetch price", ticker)
+        return False
+
+    qty = config.REDUCED_CONTRACTS if vix >= config.VIX_HALF_SIZE else config.NORMAL_CONTRACTS
+    approx_strike = round(price * (1 - config.CSP_OTM_PCT), 2)
+    required = approx_strike * 100 * qty
+
+    bp = _get_buying_power()
+    if bp < required:
+        logger.warning(
+            "%s CSP: insufficient buying power — need $%.2f, have $%.2f",
+            ticker, required, bp,
+        )
+        return False
+
+    put_contract = options_helper.find_csp_contract(ticker, price, trading_client)
+    if put_contract is None:
+        return False
+
+    actual_strike = float(put_contract.strike_price)
+    actual_required = actual_strike * 100 * qty
+    if bp < actual_required:
+        logger.warning(
+            "%s CSP: actual strike %.2f needs $%.2f collateral, only $%.2f available",
+            ticker, actual_strike, actual_required, bp,
+        )
+        return False
+
+    put_credit = options_helper.get_option_midprice(put_contract.symbol, option_data_client)
+    if not put_credit:
+        logger.warning("%s CSP: unusable quote — skipping", ticker)
+        return False
+
+    if not _sell_to_open(put_contract.symbol, qty):
+        return False
+
+    effective_cost_basis = round(actual_strike - put_credit, 4)
+    csp_id = f"CSP_{ticker}_{datetime.now(tz=timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    open_csps[csp_id] = {
+        'ticker':               ticker,
+        'put_symbol':           put_contract.symbol,
+        'put_strike':           actual_strike,
+        'put_expiry':           str(put_contract.expiration_date),
+        'put_credit':           put_credit,
+        'contracts':            qty,
+        'vix_at_entry':         vix,
+        'opened_at':            datetime.now(tz=timezone.utc),
+        'effective_cost_basis': effective_cost_basis,
+        'collateral_reserved':  actual_required,
+    }
+
+    trade_logger.log_trade(
+        action='OPEN', ticker=ticker, leg='CSP',
+        symbol=put_contract.symbol,
+        strike=actual_strike,
+        expiry=str(put_contract.expiration_date),
+        contracts=qty, entry_credit=put_credit, vix=vix,
+        notes=f"cost_basis={effective_cost_basis:.4f} collateral={actual_required:.2f}",
+    )
+    logger.info(
+        "Opened %s  %s  qty=%d  strike=%.2f  credit=%.4f  "
+        "cost_basis=%.4f  collateral=$%.2f",
+        csp_id, ticker, qty, actual_strike, put_credit,
+        effective_cost_basis, actual_required,
+    )
+    return True
+
+
+def _close_csp(csp_id: str, put_debit: float, reason: str) -> None:
+    """Buy back the short put and remove the CSP from the tracker."""
+    s   = open_csps[csp_id]
+    qty = s['contracts']
+
+    _buy_to_close(s['put_symbol'], qty)
+
+    trade_logger.log_trade(
+        action='CLOSE', ticker=s['ticker'], leg='CSP',
+        symbol=s['put_symbol'],
+        strike=s['put_strike'],
+        expiry=s['put_expiry'],
+        contracts=qty, entry_credit=s['put_credit'],
+        exit_debit=put_debit, vix=s['vix_at_entry'], notes=reason,
+    )
+    pnl = (s['put_credit'] - put_debit) * qty * 100
+    logger.info("Closed %s  reason=%-25s  pnl=$%.2f", csp_id, reason, pnl)
+
+    cooldown_until = datetime.now(tz=timezone.utc) + timedelta(hours=config.TICKER_COOLDOWN_HRS)
+    _ticker_cooldowns[s['ticker']] = cooldown_until
+    logger.info("%s: cooldown set until %s UTC",
+                s['ticker'], cooldown_until.strftime('%Y-%m-%d %H:%M'))
+
+    del open_csps[csp_id]
+
+
+def _reconcile_csps() -> None:
+    """
+    Detect CSP assignment and externally-closed CSPs by comparing the in-memory
+    tracker against live Alpaca positions.
+
+    If the put symbol is gone from the account AND the underlying stock now appears
+    as a position, we record the assignment in `assigned_shares` and remove the CSP
+    from the tracker.  If the put is gone with no stock, the position was either
+    closed externally or expired worthless; we remove it from the tracker and log.
+    """
+    if not open_csps:
+        return
+    try:
+        live = {p.symbol: p for p in trading_client.get_all_positions()}
+    except Exception as exc:
+        logger.error("Could not fetch positions for CSP reconciliation: %s", exc)
+        return
+
+    for csp_id in list(open_csps.keys()):
+        s = open_csps[csp_id]
+        if s['put_symbol'] in live:
+            continue  # still open — nothing to do
+
+        ticker = s['ticker']
+        if ticker in live:
+            # Shares delivered — assignment
+            shares = s['contracts'] * 100
+            cost_basis = s['effective_cost_basis']
+            logger.info(
+                "ASSIGNMENT detected: %s  %d shares  cost_basis=%.4f",
+                ticker, shares, cost_basis,
+            )
+            if ticker not in assigned_shares:
+                assigned_shares[ticker] = {
+                    'ticker':               ticker,
+                    'shares':               shares,
+                    'effective_cost_basis': cost_basis,
+                    'assigned_at':          datetime.now(tz=timezone.utc),
+                    'source_csp_id':        csp_id,
+                }
+                trade_logger.log_trade(
+                    action='ASSIGNED', ticker=ticker, leg='CSP',
+                    symbol=s['put_symbol'],
+                    strike=s['put_strike'],
+                    expiry=s['put_expiry'],
+                    contracts=s['contracts'],
+                    entry_credit=s['put_credit'],
+                    notes=f"cost_basis={cost_basis:.4f} shares={shares}",
+                )
+        else:
+            logger.warning(
+                "CSP %s (%s): put gone from account with no shares — "
+                "expired worthless or closed externally; removing from tracker",
+                csp_id, ticker,
+            )
+
+        del open_csps[csp_id]
+
+
+def manage_csps() -> None:
+    """
+    Check open CSPs for profit-take and stop-loss; detect assignments via reconciliation.
+
+    Profit target: same 50 % threshold as the CCS strategy.
+    Stop-loss:     same 2x-premium threshold (STOP_LOSS_PCT = 2.0).
+    Min hold:      stop-loss evaluation deferred until MIN_HOLD_DAYS.
+    """
+    _reconcile_csps()
+
+    for csp_id in list(open_csps.keys()):
+        s = open_csps[csp_id]
+
+        put_price = options_helper.get_option_midprice(s['put_symbol'], option_data_client)
+        if put_price is None:
+            logger.warning("%s: could not price CSP this cycle — skipping", csp_id)
+            continue
+
+        hold_days = (datetime.now(tz=timezone.utc) - s['opened_at']).days
+        if hold_days < config.MIN_HOLD_DAYS:
+            logger.info(
+                "%s (%s): held %d day(s) — stop-loss evaluation starts after day %d",
+                csp_id, s['ticker'], hold_days, config.MIN_HOLD_DAYS,
+            )
+            continue
+
+        profit_pct = (s['put_credit'] - put_price) / s['put_credit']
+        put_stop   = put_price > s['put_credit'] * (1 + config.STOP_LOSS_PCT)
+
+        logger.debug(
+            "%s  put=%.4f/%.4f(stop=%s)  profit=%.1f%%",
+            csp_id, put_price, s['put_credit'], 'Y' if put_stop else 'n',
+            profit_pct * 100,
+        )
+
+        if put_stop:
+            _close_csp(csp_id, put_price, 'STOP_LOSS_CSP')
+        elif profit_pct >= config.PROFIT_TAKE_MIN_PCT:
+            _close_csp(csp_id, put_price, f"PROFIT_TAKE_{profit_pct:.1%}")
+
+
+# ── Covered call open / close ──────────────────────────────────────────────────
+
+def open_covered_call(ticker: str) -> bool:
+    """
+    Sell a covered call against assigned shares of `ticker`.
+
+    Constraints enforced here:
+      • Requires an entry in `assigned_shares[ticker]` — aborts if missing.
+      • Strike must be >= effective_cost_basis (enforced inside find_covered_call_contract).
+      • No buying-power check needed — covered calls are collateralised by the shares.
+    """
+    if ticker not in assigned_shares:
+        logger.error(
+            "open_covered_call(%s): called but no assigned shares found — skipping", ticker,
+        )
+        return False
+
+    asgn      = assigned_shares[ticker]
+    shares    = asgn['shares']
+    cost_basis = asgn['effective_cost_basis']
+    contracts = shares // 100
+    if contracts == 0:
+        logger.warning("%s: fewer than 100 assigned shares — cannot write CC", ticker)
+        return False
+
+    price = market_data.get_current_price(ticker, stock_data_client)
+    if price is None:
+        logger.warning("%s CC: skipping — could not fetch price", ticker)
+        return False
+
+    call_contract = options_helper.find_covered_call_contract(
+        ticker, price, cost_basis, trading_client,
+    )
+    if call_contract is None:
+        return False
+
+    call_credit = options_helper.get_option_midprice(call_contract.symbol, option_data_client)
+    if not call_credit:
+        logger.warning("%s CC: unusable quote — skipping", ticker)
+        return False
+
+    if not _sell_to_open(call_contract.symbol, contracts):
+        return False
+
+    cc_id = f"CC_{ticker}_{datetime.now(tz=timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    open_covered_calls[cc_id] = {
+        'ticker':               ticker,
+        'call_symbol':          call_contract.symbol,
+        'call_strike':          float(call_contract.strike_price),
+        'call_expiry':          str(call_contract.expiration_date),
+        'call_credit':          call_credit,
+        'contracts':            contracts,
+        'opened_at':            datetime.now(tz=timezone.utc),
+        'effective_cost_basis': cost_basis,
+    }
+
+    trade_logger.log_trade(
+        action='OPEN', ticker=ticker, leg='CC',
+        symbol=call_contract.symbol,
+        strike=float(call_contract.strike_price),
+        expiry=str(call_contract.expiration_date),
+        contracts=contracts, entry_credit=call_credit,
+        notes=f"cost_basis={cost_basis:.4f} shares={shares}",
+    )
+    logger.info(
+        "Opened %s  %s  qty=%d  strike=%.2f  credit=%.4f  cost_basis=%.4f",
+        cc_id, ticker, contracts,
+        float(call_contract.strike_price), call_credit, cost_basis,
+    )
+    return True
+
+
+def _close_covered_call(cc_id: str, call_debit: float, reason: str) -> None:
+    """Buy back the short call and remove the CC from the tracker."""
+    s   = open_covered_calls[cc_id]
+    qty = s['contracts']
+
+    _buy_to_close(s['call_symbol'], qty)
+
+    trade_logger.log_trade(
+        action='CLOSE', ticker=s['ticker'], leg='CC',
+        symbol=s['call_symbol'],
+        strike=s['call_strike'],
+        expiry=s['call_expiry'],
+        contracts=qty, entry_credit=s['call_credit'],
+        exit_debit=call_debit, notes=reason,
+    )
+    pnl = (s['call_credit'] - call_debit) * qty * 100
+    logger.info("Closed %s  reason=%-25s  pnl=$%.2f", cc_id, reason, pnl)
+
+    del open_covered_calls[cc_id]
+
+
+def _reconcile_covered_calls() -> None:
+    """
+    Detect covered call assignment (shares called away) by comparing the tracker
+    against live Alpaca positions.
+
+    If the call symbol is gone AND the underlying stock is also gone, the shares
+    were called away.  We log the wheel completion and remove `assigned_shares[ticker]`.
+    If the call is gone but shares remain, the call expired or was closed externally.
+    """
+    if not open_covered_calls:
+        return
+    try:
+        live = {p.symbol: p for p in trading_client.get_all_positions()}
+    except Exception as exc:
+        logger.error("Could not fetch positions for CC reconciliation: %s", exc)
+        return
+
+    for cc_id in list(open_covered_calls.keys()):
+        s = open_covered_calls[cc_id]
+        if s['call_symbol'] in live:
+            continue  # still open
+
+        ticker = s['ticker']
+        if ticker not in live:
+            # Shares called away — full wheel cycle complete
+            logger.info(
+                "CC ASSIGNMENT: %s shares called away at strike=%.2f — wheel complete",
+                ticker, s['call_strike'],
+            )
+            if ticker in assigned_shares:
+                asgn = assigned_shares[ticker]
+                net_cb = asgn['effective_cost_basis']
+                locked_gain = (s['call_strike'] - net_cb) * s['contracts'] * 100
+                logger.info(
+                    "%s: wheel locked in gain ≈ $%.2f  "
+                    "(call_strike=%.2f - cost_basis=%.4f) x %d shares",
+                    ticker, locked_gain,
+                    s['call_strike'], net_cb, s['contracts'] * 100,
+                )
+                del assigned_shares[ticker]
+
+            trade_logger.log_trade(
+                action='ASSIGNED', ticker=ticker, leg='CC',
+                symbol=s['call_symbol'],
+                strike=s['call_strike'],
+                expiry=s['call_expiry'],
+                contracts=s['contracts'],
+                entry_credit=s['call_credit'],
+                notes='CC_ASSIGNED_wheel_complete',
+            )
+        else:
+            logger.info(
+                "CC %s (%s): call gone but shares remain — expired worthless or closed externally",
+                cc_id, ticker,
+            )
+
+        del open_covered_calls[cc_id]
+
+
+def manage_covered_calls() -> None:
+    """
+    Check open covered calls for profit-take and stop-loss.
+
+    Stop-loss on a CC means buying back the short call when it has run against
+    us — the shares are still held, so a new CC can be sold next cycle once the
+    cooldown period ends.  No per-ticker cooldown is set here because we still own
+    the shares and want to keep selling calls against them.
+    """
+    _reconcile_covered_calls()
+
+    for cc_id in list(open_covered_calls.keys()):
+        s = open_covered_calls[cc_id]
+
+        call_price = options_helper.get_option_midprice(s['call_symbol'], option_data_client)
+        if call_price is None:
+            logger.warning("%s: could not price CC this cycle — skipping", cc_id)
+            continue
+
+        hold_days = (datetime.now(tz=timezone.utc) - s['opened_at']).days
+        if hold_days < config.MIN_HOLD_DAYS:
+            logger.info(
+                "%s (%s): held %d day(s) — stop-loss evaluation starts after day %d",
+                cc_id, s['ticker'], hold_days, config.MIN_HOLD_DAYS,
+            )
+            continue
+
+        profit_pct = (s['call_credit'] - call_price) / s['call_credit']
+        call_stop  = call_price > s['call_credit'] * (1 + config.STOP_LOSS_PCT)
+
+        logger.debug(
+            "%s  call=%.4f/%.4f(stop=%s)  profit=%.1f%%",
+            cc_id, call_price, s['call_credit'], 'Y' if call_stop else 'n',
+            profit_pct * 100,
+        )
+
+        if call_stop:
+            _close_covered_call(cc_id, call_price, 'STOP_LOSS_CC')
+        elif profit_pct >= config.PROFIT_TAKE_MIN_PCT:
+            _close_covered_call(cc_id, call_price, f"PROFIT_TAKE_{profit_pct:.1%}")
+
+
 # ── Main strategy cycle ────────────────────────────────────────────────────────
 
 def run_cycle() -> None:
     """
-    Execute one full strategy iteration.
+    Execute one full strategy iteration across all three sub-strategies.
 
     Order of operations:
-      1. Verify the market is currently open.
-      2. Fetch VIX — skip new entries if too high; manage existing either way.
-      3. Manage open positions (profit targets and stops).
-      4. Open new strangles if capacity allows and conditions are met.
-         • One strangle per ticker maximum.
-         • Respect the MAX_STRANGLES global cap.
-         • Skip tickers near earnings.
-         • Stop new entries CLOSE_BUFFER_MIN minutes before market close.
+      1. Verify the market is open.
+      2. Fetch VIX — skip new entries if too high; always manage existing.
+      3. Snapshot open tickers BEFORE management calls so a position closed
+         this cycle cannot be reopened in the same cycle.
+      4. Manage CCS strangles, CSPs, and covered calls.
+      5. Open new CCS strangles (AMZN/META) up to MAX_STRANGLES.
+      6. Open new CSPs (MSFT/AAPL) if buying power allows.
+      7. Open new covered calls against any assigned shares.
+         Covered calls do NOT count toward MAX_STRANGLES.
     """
     if not market_data.is_market_open():
         logger.debug("Market closed — no action this cycle")
         return
 
     mins_left = market_data.minutes_to_close()
-    logger.info("=== Strategy cycle  (%d min to close,  open=%d/%d) ===",
-                mins_left, len(open_strangles), config.MAX_STRANGLES)
+    logger.info(
+        "=== Strategy cycle  (%d min to close | "
+        "CCS=%d/%d  CSP=%d  CC=%d  assigned=%d) ===",
+        mins_left,
+        len(open_strangles), config.MAX_STRANGLES,
+        len(open_csps),
+        len(open_covered_calls),
+        len(assigned_shares),
+    )
 
     # ── VIX gate ───────────────────────────────────────────────────────────────
     vix = market_data.get_vix_level()
     if vix is None:
         logger.warning("VIX unavailable — managing existing positions only this cycle")
         manage_positions()
+        manage_csps()
+        manage_covered_calls()
         return
 
     logger.info("VIX = %.2f", vix)
 
+    # Snapshot BEFORE any manage call — prevents same-cycle close+reopen.
+    tickers_with_strangles    = {s['ticker'] for s in open_strangles.values()}
+    tickers_with_csps         = {s['ticker'] for s in open_csps.values()}
+    tickers_with_covered_calls = {s['ticker'] for s in open_covered_calls.values()}
+
     if vix >= config.VIX_NO_TRADE:
         logger.info(
-            "VIX %.2f is at or above the no-trade threshold (%.0f) — "
+            "VIX %.2f >= no-trade threshold (%.0f) — "
             "no new entries; managing existing positions only",
             vix, config.VIX_NO_TRADE,
         )
         manage_positions()
+        manage_csps()
+        manage_covered_calls()
         return
 
-    # ── Manage open positions ──────────────────────────────────────────────────
-    # Snapshot tickers BEFORE manage_positions() so that a position closed by
-    # the stop-loss this cycle cannot be reopened in the same cycle.
-    tickers_with_positions = {s['ticker'] for s in open_strangles.values()}
     manage_positions()
+    manage_csps()
+    manage_covered_calls()
 
-    # ── New entries ────────────────────────────────────────────────────────────
-    # Stop opening positions in the last CLOSE_BUFFER_MIN minutes of the session;
-    # we still continue to manage existing ones above.
+    # ── Stop opening new positions near market close ────────────────────────────
     if mins_left <= config.CLOSE_BUFFER_MIN:
         logger.info(
             "Within %d minutes of market close — no new entries this cycle",
@@ -573,66 +1011,97 @@ def run_cycle() -> None:
         )
         return
 
-    available_slots = config.MAX_STRANGLES - len(open_strangles)
-    if available_slots <= 0:
-        logger.info("At capacity (%d/%d strangles) — no new entries",
-                    len(open_strangles), config.MAX_STRANGLES)
-        return
-
-    logger.info("%d slot(s) open for new strangles", available_slots)
-
     now_utc = datetime.now(tz=timezone.utc)
 
-    for ticker in config.WATCH_LIST:
-        if len(open_strangles) >= config.MAX_STRANGLES:
-            break
+    # ── New CCS strangles (AMZN, META) ────────────────────────────────────────
+    ccs_slots = config.MAX_STRANGLES - len(open_strangles)
+    if ccs_slots > 0:
+        logger.info("%d CCS slot(s) available", ccs_slots)
+        for ticker in config.CCS_TICKERS:
+            if len(open_strangles) >= config.MAX_STRANGLES:
+                break
+            if ticker in tickers_with_strangles:
+                logger.info("%s: CCS already open — skipping", ticker)
+                continue
+            cooldown_until = _ticker_cooldowns.get(ticker)
+            if cooldown_until and now_utc < cooldown_until:
+                logger.info("%s: CCS cooldown until %s UTC — skipping",
+                            ticker, cooldown_until.strftime('%Y-%m-%d %H:%M'))
+                continue
+            if market_data.is_near_earnings(ticker, config.EARNINGS_BUFFER_DAYS):
+                logger.info("%s: near earnings — skipping CCS", ticker)
+                continue
+            logger.info("Attempting CCS on %s (VIX=%.2f)", ticker, vix)
+            open_strangle(ticker, vix)
+    else:
+        logger.info("CCS at capacity (%d/%d) — no new entries",
+                    len(open_strangles), config.MAX_STRANGLES)
 
-        if ticker in tickers_with_positions:
-            logger.info("%s: already has an open strangle — skipping", ticker)
+    # ── New CSPs (MSFT, AAPL) ─────────────────────────────────────────────────
+    for ticker in config.CSP_TICKERS:
+        if ticker in tickers_with_csps:
+            logger.info("%s: CSP already open — skipping", ticker)
             continue
-
-        # ── Cooldown check ─────────────────────────────────────────────────────
         cooldown_until = _ticker_cooldowns.get(ticker)
         if cooldown_until and now_utc < cooldown_until:
-            logger.info(
-                "%s: cooldown active until %s UTC — skipping",
-                ticker, cooldown_until.strftime('%Y-%m-%d %H:%M'),
-            )
+            logger.info("%s: CSP cooldown until %s UTC — skipping",
+                        ticker, cooldown_until.strftime('%Y-%m-%d %H:%M'))
             continue
-
-        # ── Earnings check ─────────────────────────────────────────────────────
-        # Never hold a short strangle through an earnings announcement — the
-        # implied volatility crush before earnings looks good for sellers, but
-        # the gap risk on the announcement day can far exceed the premium collected.
         if market_data.is_near_earnings(ticker, config.EARNINGS_BUFFER_DAYS):
-            logger.info("%s: skipped — earnings within %d days", ticker, config.EARNINGS_BUFFER_DAYS)
+            logger.info("%s: near earnings — skipping CSP", ticker)
             continue
+        logger.info("Attempting CSP on %s (VIX=%.2f)", ticker, vix)
+        open_csp(ticker, vix)
 
-        logger.info("Attempting to open strangle on %s (VIX=%.2f)", ticker, vix)
-        open_strangle(ticker, vix)
+    # ── Covered calls on assigned shares ──────────────────────────────────────
+    # Not subject to MAX_STRANGLES or cooldown — we always want to monetise
+    # shares we've been assigned.
+    for ticker in list(assigned_shares.keys()):
+        if ticker in tickers_with_covered_calls:
+            logger.info("%s: CC already open — skipping", ticker)
+            continue
+        logger.info(
+            "Attempting CC on assigned %s (cost_basis=%.4f)",
+            ticker, assigned_shares[ticker]['effective_cost_basis'],
+        )
+        open_covered_call(ticker)
 
-    logger.info("=== Cycle end — open strangles: %d/%d ===",
-                len(open_strangles), config.MAX_STRANGLES)
+    logger.info(
+        "=== Cycle end | CCS=%d/%d  CSP=%d  CC=%d  assigned=%d ===",
+        len(open_strangles), config.MAX_STRANGLES,
+        len(open_csps), len(open_covered_calls), len(assigned_shares),
+    )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    logger.info("=" * 65)
-    logger.info("Call Credit Spread + Cash-Secured Put Bot — PAPER TRADING")
-    logger.info("  Watchlist    : %s", ', '.join(config.WATCH_LIST))
-    logger.info("  DTE window   : %d – %d days", config.MIN_DTE, config.MAX_DTE)
-    logger.info("  Call leg     : Sell %.1f%% OTM call; buy %d strikes higher (spread)",
+    logger.info("=" * 70)
+    logger.info("Wheel Strategy Bot — PAPER TRADING")
+    logger.info("  --- Call Credit Spread strategy (CCS) ---")
+    logger.info("  Tickers      : %s", ', '.join(config.CCS_TICKERS))
+    logger.info("  DTE window   : %d-%d days", config.MIN_DTE, config.MAX_DTE)
+    logger.info("  Call spread  : Sell %.1f%% OTM; buy %d strikes higher",
                 config.CALL_OTM_PCT * 100, config.CALL_SPREAD_WIDTH)
-    logger.info("  Put leg      : Sell %.1f%% OTM put (cash-secured)", config.PUT_OTM_PCT * 100)
-    logger.info("  Max positions: %d", config.MAX_STRANGLES)
-    logger.info("  Profit take  : %.0f%% – %.0f%% of max profit",
-                config.PROFIT_TAKE_MIN_PCT * 100, config.PROFIT_TAKE_MAX_PCT * 100)
-    logger.info("  Stop loss    : %.0f%% of entry credit per component", config.STOP_LOSS_PCT * 100)
+    logger.info("  Put leg      : Sell %.1f%% OTM", config.PUT_OTM_PCT * 100)
+    logger.info("  Max CCS open : %d", config.MAX_STRANGLES)
+    logger.info("  --- Cash-Secured Put + Wheel strategy (CSP) ---")
+    logger.info("  Tickers      : %s", ', '.join(config.CSP_TICKERS))
+    logger.info("  CSP strike   : %.1f%% OTM  |  DTE %d-%d days",
+                config.CSP_OTM_PCT * 100, config.MIN_DTE, config.MAX_DTE)
+    logger.info("  CC strike    : %.1f%%-%.1f%% OTM  |  DTE %d-%d days (weekly)",
+                config.CC_OTM_PCT_MIN * 100, config.CC_OTM_PCT_MAX * 100,
+                config.CC_MIN_DTE, config.CC_MAX_DTE)
+    logger.info("  --- Shared parameters ---")
+    logger.info("  Profit take  : %.0f%%-%.0f%%  |  Stop loss : %.0fx premium",
+                config.PROFIT_TAKE_MIN_PCT * 100, config.PROFIT_TAKE_MAX_PCT * 100,
+                config.STOP_LOSS_PCT)
+    logger.info("  Min hold     : %d day(s)  |  Cooldown : %d hrs after any close",
+                config.MIN_HOLD_DAYS, config.TICKER_COOLDOWN_HRS)
     logger.info("  VIX gates    : no-trade >= %.0f  |  half-size >= %.0f",
                 config.VIX_NO_TRADE, config.VIX_HALF_SIZE)
     logger.info("  Trade log    : %s", config.TRADE_LOG_FILE)
-    logger.info("=" * 65)
+    logger.info("=" * 70)
 
     # Run one cycle immediately on startup so we don't wait CHECK_INTERVAL_MIN
     run_cycle()

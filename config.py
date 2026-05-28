@@ -5,11 +5,15 @@ Edit values here to tune the strategy. Trading logic modules import from
 this file — no magic numbers should appear anywhere else in the codebase.
 """
 
-# ── Watchlist ──────────────────────────────────────────────────────────────────
-# Large-cap, liquid stocks with active options markets and tight bid-ask spreads.
-WATCH_LIST = ['MSFT', 'AAPL', 'AMZN', 'META']
+# ── Watchlists ─────────────────────────────────────────────────────────────────
+# CCS tickers run the call credit spread + put strangle (original strategy).
+# CSP tickers run the wheel strategy: sell cash-secured put → if assigned,
+# sell covered calls until shares are called away.
+CCS_TICKERS = ['AMZN', 'META']
+CSP_TICKERS = ['MSFT', 'AAPL']
+WATCH_LIST  = CCS_TICKERS + CSP_TICKERS   # kept for logging convenience
 
-# ── Strangle construction ──────────────────────────────────────────────────────
+# ── Call credit spread + put strangle construction (CCS_TICKERS) ───────────────
 # How far out-of-the-money (OTM) to sell each leg, expressed as a fraction of
 # the current stock price.
 CALL_OTM_PCT      = 0.025   # Sell call ~2.5 % above spot
@@ -50,6 +54,17 @@ MIN_HOLD_DAYS = 1
 # After any close (stop or profit), block re-entering the same ticker for this
 # many hours.  Prevents the open->stop->reopen loop that generates 24+ trades.
 TICKER_COOLDOWN_HRS = 24
+
+# ── Cash-secured put construction (CSP_TICKERS — wheel strategy) ───────────────
+# Deeper OTM than the strangle put: gives more cushion and lowers the effective
+# cost basis if assigned.
+CSP_OTM_PCT = 0.05          # Sell put 5 % below spot
+
+# ── Covered call construction (only after CSP assignment) ──────────────────────
+CC_OTM_PCT_MIN = 0.03       # Strike must be at least 3 % above current spot
+CC_OTM_PCT_MAX = 0.05       # Target strike ~5 % above current spot
+CC_MIN_DTE     = 5          # Weekly options: at least 5 days to expiration
+CC_MAX_DTE     = 9          # Cap at 9 days to stay in the weekly window
 
 # ── VIX filters ────────────────────────────────────────────────────────────────
 # High-volatility environments make short premium strategies riskier.

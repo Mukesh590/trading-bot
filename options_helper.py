@@ -157,6 +157,104 @@ def find_strangle_contracts(
     return short_call, long_call, put_contract
 
 
+def find_csp_contract(
+    ticker: str,
+    current_price: float,
+    trading_client: TradingClient,
+) -> Optional[object]:
+    """
+    Find the put contract for a cash-secured put at CSP_OTM_PCT below spot,
+    in the standard 30-45 DTE window.
+    Returns the single best contract or None.
+    """
+    put_target = round(current_price * (1 - config.CSP_OTM_PCT), 2)
+    min_exp, max_exp = _expiry_window()
+
+    logger.info(
+        "%s CSP: spot=%.2f  put_target=%.2f  exp=[%s -> %s]",
+        ticker, current_price, put_target, min_exp, max_exp,
+    )
+
+    try:
+        puts = _fetch_chain(ticker, 'put', min_exp, max_exp, trading_client)
+    except Exception as exc:
+        logger.error("CSP chain fetch failed for %s: %s", ticker, exc)
+        return None
+
+    if not puts:
+        logger.warning("%s: empty put chain for CSP — options may not be enabled", ticker)
+        return None
+
+    contract = _nearest_strike(puts, put_target)
+    if contract:
+        logger.info("%s CSP selected -> %s  strike=%.2f  exp=%s",
+                    ticker, contract.symbol, float(contract.strike_price),
+                    contract.expiration_date)
+    return contract
+
+
+def _cc_expiry_window() -> Tuple[date, date]:
+    """Return (min_expiry, max_expiry) for weekly covered calls."""
+    today = date.today()
+    return today + timedelta(days=config.CC_MIN_DTE), today + timedelta(days=config.CC_MAX_DTE)
+
+
+def find_covered_call_contract(
+    ticker: str,
+    current_price: float,
+    cost_basis: float,
+    trading_client: TradingClient,
+) -> Optional[object]:
+    """
+    Find a call contract for a covered call in the weekly window (CC_MIN_DTE–CC_MAX_DTE).
+
+    Selection rules:
+      • Strike >= current_price * (1 + CC_OTM_PCT_MIN)   — at least 3 % OTM
+      • Strike >= cost_basis                              — never sell below breakeven
+      • Among eligible strikes, pick the one closest to current_price * (1 + CC_OTM_PCT_MAX)
+
+    Returns the best contract or None if no eligible strike exists.
+    """
+    call_target  = round(current_price * (1 + config.CC_OTM_PCT_MAX), 2)
+    call_min_otm = round(current_price * (1 + config.CC_OTM_PCT_MIN), 2)
+    min_exp, max_exp = _cc_expiry_window()
+
+    # The strike must clear both the OTM floor and the cost-basis floor.
+    min_eligible_strike = max(call_min_otm, cost_basis)
+
+    logger.info(
+        "%s CC: spot=%.2f  min_strike=%.2f (otm_floor=%.2f cost_basis=%.2f)  "
+        "target=%.2f  exp=[%s -> %s]",
+        ticker, current_price, min_eligible_strike, call_min_otm, cost_basis,
+        call_target, min_exp, max_exp,
+    )
+
+    try:
+        calls = _fetch_chain(ticker, 'call', min_exp, max_exp, trading_client)
+    except Exception as exc:
+        logger.error("CC chain fetch failed for %s: %s", ticker, exc)
+        return None
+
+    if not calls:
+        logger.warning("%s: empty call chain in weekly window", ticker)
+        return None
+
+    candidates = [c for c in calls if float(c.strike_price) >= min_eligible_strike]
+    if not candidates:
+        logger.warning(
+            "%s: no call strikes >= %.2f in weekly window (cost_basis=%.2f)",
+            ticker, min_eligible_strike, cost_basis,
+        )
+        return None
+
+    contract = min(candidates, key=lambda c: abs(float(c.strike_price) - call_target))
+    logger.info(
+        "%s CC selected -> %s  strike=%.2f  exp=%s",
+        ticker, contract.symbol, float(contract.strike_price), contract.expiration_date,
+    )
+    return contract
+
+
 def get_option_midprice(
     symbol: str,
     data_client: OptionHistoricalDataClient,
