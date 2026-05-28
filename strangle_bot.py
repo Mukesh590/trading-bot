@@ -449,14 +449,26 @@ def open_strangle(ticker: str, vix: float) -> bool:
         'opened_at':          datetime.now(tz=timezone.utc),
     }
 
-    # Log the CALL_SPREAD (net credit), plus the PUT only if it actually opened
+    # Log BOTH call legs of the credit spread as first-class rows so the
+    # position is unambiguously a CALL_CREDIT_SPREAD (short call + long call),
+    # never mistaken for a naked call.  The PUT is logged only if it opened.
     trade_logger.log_trade(
-        action='OPEN', ticker=ticker, leg='CALL_SPREAD',
+        action='OPEN', ticker=ticker, leg='SHORT_CALL',
         symbol=short_call.symbol,
         strike=float(short_call.strike_price),
         expiry=str(short_call.expiration_date),
-        contracts=qty, entry_credit=call_spread_credit, vix=vix,
-        notes=f"long={long_call.symbol}@{long_call_debit:.4f}",
+        contracts=qty, entry_credit=short_call_credit, vix=vix,
+        position_type='CALL_CREDIT_SPREAD', side='SHORT',
+        notes=f"spread_net_credit={call_spread_credit:.4f}",
+    )
+    trade_logger.log_trade(
+        action='OPEN', ticker=ticker, leg='LONG_CALL',
+        symbol=long_call.symbol,
+        strike=float(long_call.strike_price),
+        expiry=str(long_call.expiration_date),
+        contracts=qty, entry_credit=long_call_debit, vix=vix,
+        position_type='CALL_CREDIT_SPREAD', side='LONG',
+        notes=f"hedge for {short_call.symbol}",
     )
     if put_opened:
         trade_logger.log_trade(
@@ -465,6 +477,7 @@ def open_strangle(ticker: str, vix: float) -> bool:
             strike=float(put_contract.strike_price),
             expiry=str(put_contract.expiration_date),
             contracts=qty, entry_credit=put_credit, vix=vix,
+            position_type='CASH_SECURED_PUT', side='SHORT',
         )
 
     net_credit_dollars = (call_spread_credit + put_credit) * qty * 100
@@ -489,16 +502,20 @@ def open_strangle(ticker: str, vix: float) -> bool:
 
 def _close_strangle(
     sid: str,
-    spread_debit: float,
+    short_call_price: float,
+    long_call_price: float,
     put_debit: float,
     reason: str,
 ) -> None:
     """
     Close the position's legs, log the result, and remove it from the tracker.
 
-    spread_debit  — net cost to close the call spread (short_call_price - long_call_price).
-                    Buy back the short call and sell the long call.
-    put_debit     — market price to buy back the put (ignored if no put leg).
+    short_call_price — market price to buy back the short call.
+    long_call_price  — market price to sell the long (hedge) call.
+    put_debit        — market price to buy back the put (ignored if no put leg).
+
+    Each call leg is logged separately (SHORT_CALL, LONG_CALL) so the close
+    mirrors the open and the spread is always represented by both legs.
     """
     s   = open_strangles[sid]
     qty = s['contracts']
@@ -510,12 +527,22 @@ def _close_strangle(
         _buy_to_close(s['put_symbol'], qty)
 
     trade_logger.log_trade(
-        action='CLOSE', ticker=s['ticker'], leg='CALL_SPREAD',
+        action='CLOSE', ticker=s['ticker'], leg='SHORT_CALL',
         symbol=s['short_call_symbol'],
         strike=s['short_call_strike'],
         expiry=s['short_call_expiry'],
-        contracts=qty, entry_credit=s['call_spread_credit'],
-        exit_debit=spread_debit, vix=s['vix_at_entry'], notes=reason,
+        contracts=qty, entry_credit=s['short_call_credit'],
+        exit_debit=short_call_price, vix=s['vix_at_entry'],
+        position_type='CALL_CREDIT_SPREAD', side='SHORT', notes=reason,
+    )
+    trade_logger.log_trade(
+        action='CLOSE', ticker=s['ticker'], leg='LONG_CALL',
+        symbol=s['long_call_symbol'],
+        strike=s['long_call_strike'],
+        expiry=s['long_call_expiry'],
+        contracts=qty, entry_credit=s['long_call_debit'],
+        exit_debit=long_call_price, vix=s['vix_at_entry'],
+        position_type='CALL_CREDIT_SPREAD', side='LONG', notes=reason,
     )
     if has_put:
         trade_logger.log_trade(
@@ -524,9 +551,12 @@ def _close_strangle(
             strike=s['put_strike'],
             expiry=s['put_expiry'],
             contracts=qty, entry_credit=s['put_credit'],
-            exit_debit=put_debit, vix=s['vix_at_entry'], notes=reason,
+            exit_debit=put_debit, vix=s['vix_at_entry'],
+            position_type='CASH_SECURED_PUT', side='SHORT', notes=reason,
         )
 
+    # Net cost to close the spread = short buyback - long sale (per share).
+    spread_debit = round(short_call_price - long_call_price, 4)
     spread_pnl = (s['call_spread_credit'] - spread_debit) * qty * 100
     put_pnl    = (s['put_credit'] - put_debit) * qty * 100 if has_put else 0.0
     logger.info(
@@ -616,10 +646,12 @@ def manage_positions() -> None:
 
         if spread_stop or put_stop:
             triggered_leg = 'CALL_SPREAD' if spread_stop else 'PUT'
-            _close_strangle(sid, spread_value_now, put_price, f"STOP_LOSS_{triggered_leg}")
+            _close_strangle(sid, short_call_price, long_call_price, put_price,
+                            f"STOP_LOSS_{triggered_leg}")
 
         elif profit_pct >= config.PROFIT_TAKE_MIN_PCT:
-            _close_strangle(sid, spread_value_now, put_price, f"PROFIT_TAKE_{profit_pct:.1%}")
+            _close_strangle(sid, short_call_price, long_call_price, put_price,
+                            f"PROFIT_TAKE_{profit_pct:.1%}")
 
 
 # ── Put backfill ────────────────────────────────────────────────────────────────
