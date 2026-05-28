@@ -36,10 +36,11 @@ CALL_SPREAD_WIDTH = 5       # Buy a call this many strikes above the short call 
 MIN_DTE = 30
 MAX_DTE = 45
 
-# Maximum number of open positions at any given time, counted GLOBALLY across
-# every strategy: call credit spreads (CCS) + cash-secured puts (CSP) +
-# covered calls (CC) combined must never exceed this number.  Limits capital at
-# risk and keeps margin usage manageable.
+# Maximum number of open positions at any given time, counted across the two
+# premium-selling entry strategies: call credit spreads (CCS) + cash-secured
+# puts (CSP) combined must never exceed this number.  Covered calls are EXEMPT —
+# they monetise shares we were already assigned and are always written.  Limits
+# capital at risk and keeps margin usage manageable.
 MAX_STRANGLES = 3
 
 # ── Profit / loss management ───────────────────────────────────────────────────

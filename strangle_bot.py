@@ -12,7 +12,7 @@ Strategy rules
                    higher on the same expiry to cap upside risk (credit spread)
   Put  leg       : Sell put  ≈ 2.5 % below current spot (cash-secured)
   DTE window     : 30 – 45 days to expiration
-  Max open       : 3 concurrent positions GLOBALLY (CCS + CSP + CC combined)
+  Max open       : 3 concurrent CCS + CSP positions (covered calls are exempt)
   Profit target  : Close when >= 50 % of max profit is captured (up to 70 % ideal)
   Stop loss      : Close entire position if call spread value or put value exceeds
                    entry credit * 1.10
@@ -157,16 +157,18 @@ def _get_buying_power() -> float:
         return 0.0
 
 
-def _total_open_positions() -> int:
+def _capped_open_positions() -> int:
     """
-    Total number of open positions counted GLOBALLY across every strategy:
-    call credit spreads (CCS) + cash-secured puts (CSP) + covered calls (CC).
+    Number of open positions that count toward the MAX_STRANGLES capacity check:
+    call credit spreads (CCS) + cash-secured puts (CSP).
 
-    This is the single source of truth for the MAX_STRANGLES capacity check, so
-    that, e.g., two CSPs on MSFT/AAPL plus one CCS already fills all three slots
-    and no fourth position of any type can be opened.
+    Covered calls are deliberately EXCLUDED — they are written against shares we
+    were already assigned and must always be monetised, regardless of how many
+    CCS/CSP positions are open.  So, e.g., two CSPs on MSFT/AAPL plus one CCS
+    fills all three slots and no fourth CCS/CSP can open, but a covered call on
+    assigned shares may still be written.
     """
-    return len(open_strangles) + len(open_csps) + len(open_covered_calls)
+    return len(open_strangles) + len(open_csps)
 
 
 def _prune_stale_cooldowns() -> None:
@@ -991,12 +993,12 @@ def run_cycle() -> None:
       3. Snapshot open tickers BEFORE management calls so a position closed
          this cycle cannot be reopened in the same cycle.
       4. Manage CCS strangles, CSPs, and covered calls.
-      5. Open new positions (CCS on META/SPY/QQQ, then CSPs on MSFT/AAPL, then
-         covered calls on assigned shares) while the GLOBAL open-position count
-         stays under the cap.  The cap is MAX_STRANGLES normally, or
-         VIX_ELEVATED_MAX_POSITIONS when VIX is elevated (>= VIX_ELEVATED).
-         Every position type — CCS, CSP and CC — counts toward this single cap,
-         so the total can never exceed it.
+      5. Open new CCS (META/SPY/QQQ) then CSPs (MSFT/AAPL) while the capped
+         open-position count (CCS + CSP) stays under the cap.  The cap is
+         MAX_STRANGLES normally, or VIX_ELEVATED_MAX_POSITIONS when VIX is
+         elevated (>= VIX_ELEVATED).
+      6. Write covered calls on any assigned shares — NOT subject to the cap, so
+         assigned shares are always monetised regardless of CCS/CSP count.
     """
     if not market_data.is_market_open():
         logger.debug("Market closed — no action this cycle")
@@ -1054,27 +1056,27 @@ def run_cycle() -> None:
 
     now_utc = datetime.now(tz=timezone.utc)
 
-    # ── Global position cap ────────────────────────────────────────────────────
-    # A SINGLE cap governs how many positions of ANY type may be open at once.
-    # When VIX is elevated (>= VIX_ELEVATED but < VIX_NO_TRADE) we allow only
-    # VIX_ELEVATED_MAX_POSITIONS open at once — one position, full size — rather
-    # than trading reduced contract counts across several.
+    # ── Position cap (CCS + CSP only) ──────────────────────────────────────────
+    # The cap governs how many CCS + CSP positions may be open at once.  Covered
+    # calls are exempt (see below).  When VIX is elevated (>= VIX_ELEVATED but
+    # < VIX_NO_TRADE) we allow only VIX_ELEVATED_MAX_POSITIONS open at once — one
+    # position, full size — rather than trading reduced contract counts.
     if vix >= config.VIX_ELEVATED:
         position_cap = config.VIX_ELEVATED_MAX_POSITIONS
         logger.info(
-            "VIX %.2f >= elevated threshold (%.0f) — capping total open positions at %d",
+            "VIX %.2f >= elevated threshold (%.0f) — capping open CCS+CSP positions at %d",
             vix, config.VIX_ELEVATED, position_cap,
         )
     else:
         position_cap = config.MAX_STRANGLES
 
     def _at_capacity() -> bool:
-        """True when no further positions of any type may be opened this cycle."""
-        if _total_open_positions() >= position_cap:
+        """True when no further CCS/CSP positions may be opened this cycle."""
+        if _capped_open_positions() >= position_cap:
             logger.info(
-                "At global position cap (%d/%d open: CCS=%d CSP=%d CC=%d) — no new entries",
-                _total_open_positions(), position_cap,
-                len(open_strangles), len(open_csps), len(open_covered_calls),
+                "At position cap (%d/%d open: CCS=%d CSP=%d) — no new CCS/CSP entries",
+                _capped_open_positions(), position_cap,
+                len(open_strangles), len(open_csps),
             )
             return True
         return False
@@ -1098,7 +1100,7 @@ def run_cycle() -> None:
         open_strangle(ticker, vix)
 
     # ── New CSPs (MSFT, AAPL) ─────────────────────────────────────────────────
-    # CSPs count toward the same global cap as CCS, so an open CSP on MSFT/AAPL
+    # CSPs count toward the same cap as CCS, so an open CSP on MSFT/AAPL
     # consumes a slot that a CCS would otherwise use (and vice versa).
     for ticker in config.CSP_TICKERS:
         if _at_capacity():
@@ -1118,13 +1120,10 @@ def run_cycle() -> None:
         open_csp(ticker, vix)
 
     # ── Covered calls on assigned shares ──────────────────────────────────────
-    # Covered calls also count toward the global cap.  Note the wheel is
-    # self-balancing here: a CSP that gets assigned is removed from open_csps
-    # (freeing its slot) before its covered call is written, so monetising
-    # assigned shares does not by itself push the total over the cap.
+    # EXEMPT from the position cap: covered calls are written against shares we
+    # were already assigned and must always be monetised, no matter how many
+    # CCS/CSP positions are open.  (No _at_capacity() gate here on purpose.)
     for ticker in list(assigned_shares.keys()):
-        if _at_capacity():
-            break
         if ticker in tickers_with_covered_calls:
             logger.info("%s: CC already open — skipping", ticker)
             continue
@@ -1135,8 +1134,8 @@ def run_cycle() -> None:
         open_covered_call(ticker)
 
     logger.info(
-        "=== Cycle end | total=%d/%d (CCS=%d CSP=%d CC=%d)  assigned=%d ===",
-        _total_open_positions(), position_cap,
+        "=== Cycle end | CCS+CSP=%d/%d (CCS=%d CSP=%d)  CC=%d (exempt)  assigned=%d ===",
+        _capped_open_positions(), position_cap,
         len(open_strangles), len(open_csps), len(open_covered_calls),
         len(assigned_shares),
     )
@@ -1153,7 +1152,7 @@ def main() -> None:
     logger.info("  Call spread  : Sell %.1f%% OTM; buy %d strikes higher",
                 config.CALL_OTM_PCT * 100, config.CALL_SPREAD_WIDTH)
     logger.info("  Put leg      : Sell %.1f%% OTM", config.PUT_OTM_PCT * 100)
-    logger.info("  Max open     : %d (GLOBAL — CCS + CSP + CC combined)", config.MAX_STRANGLES)
+    logger.info("  Max open     : %d (CCS + CSP combined; covered calls exempt)", config.MAX_STRANGLES)
     logger.info("  --- Cash-Secured Put + Wheel strategy (CSP) ---")
     logger.info("  Tickers      : %s", ', '.join(config.CSP_TICKERS))
     logger.info("  CSP strike   : %.1f%% OTM  |  DTE %d-%d days",
