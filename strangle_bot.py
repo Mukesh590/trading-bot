@@ -38,7 +38,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
 
 import schedule
@@ -108,24 +108,29 @@ trading_client, stock_data_client, option_data_client = _init_clients()
 # Maps a unique position ID -> dict with all data needed to manage the position.
 #
 # Schema:
-#   ticker              str    underlying stock symbol
-#   short_call_symbol   str    OCC symbol — short leg of call credit spread
-#   long_call_symbol    str    OCC symbol — long (hedge) leg of call credit spread
-#   put_symbol          str    OCC symbol — cash-secured put
-#   short_call_strike   float  short call strike price
-#   long_call_strike    float  long call strike price
-#   put_strike          float  put strike price
-#   short_call_expiry   str    short call expiration date (YYYY-MM-DD)
-#   long_call_expiry    str    long call expiration date (YYYY-MM-DD)
-#   put_expiry          str    put expiration date (YYYY-MM-DD)
-#   short_call_credit   float  per-share credit received for the short call
-#   long_call_debit     float  per-share debit paid for the long call
-#   call_spread_credit  float  net credit for the call spread (short - long)
-#   put_credit          float  per-share credit received for the put
-#   contracts           int    number of contracts per leg (each = 100 shares)
-#   vix_at_entry        float  VIX level when the position was opened
+#   ticker              str      underlying stock symbol
+#   short_call_symbol   str      OCC symbol — short leg of call credit spread
+#   long_call_symbol    str      OCC symbol — long (hedge) leg of call credit spread
+#   put_symbol          str      OCC symbol — cash-secured put
+#   short_call_strike   float    short call strike price
+#   long_call_strike    float    long call strike price
+#   put_strike          float    put strike price
+#   short_call_expiry   str      short call expiration date (YYYY-MM-DD)
+#   long_call_expiry    str      long call expiration date (YYYY-MM-DD)
+#   put_expiry          str      put expiration date (YYYY-MM-DD)
+#   short_call_credit   float    per-share credit received for the short call
+#   long_call_debit     float    per-share debit paid for the long call
+#   call_spread_credit  float    net credit for the call spread (short - long)
+#   put_credit          float    per-share credit received for the put
+#   contracts           int      number of contracts per leg (each = 100 shares)
+#   vix_at_entry        float    VIX level when the position was opened
+#   opened_at           datetime UTC timestamp when the position was opened
 open_strangles: Dict[str, dict] = {}
 _id_counter = 0
+
+# Per-ticker re-entry block: maps ticker -> UTC datetime before which no new
+# strangle may be opened on that ticker.  Set on every close (profit or stop).
+_ticker_cooldowns: Dict[str, datetime] = {}
 
 
 def _new_strangle_id(ticker: str) -> str:
@@ -355,6 +360,7 @@ def open_strangle(ticker: str, vix: float) -> bool:
         'put_credit':         put_credit,
         'contracts':          qty,
         'vix_at_entry':       vix,
+        'opened_at':          datetime.now(tz=timezone.utc),
     }
 
     # Log as CALL_SPREAD (net credit) + PUT to the CSV
@@ -432,6 +438,13 @@ def _close_strangle(
         sid, reason, spread_pnl, put_pnl, spread_pnl + put_pnl,
     )
 
+    cooldown_until = datetime.now(tz=timezone.utc) + timedelta(hours=config.TICKER_COOLDOWN_HRS)
+    _ticker_cooldowns[s['ticker']] = cooldown_until
+    logger.info(
+        "%s: cooldown set — no new entry until %s UTC",
+        s['ticker'], cooldown_until.strftime('%Y-%m-%d %H:%M'),
+    )
+
     del open_strangles[sid]
 
 
@@ -464,6 +477,16 @@ def manage_positions() -> None:
 
         if short_call_price is None or long_call_price is None or put_price is None:
             logger.warning("%s: could not price all legs this cycle — skipping", sid)
+            continue
+
+        # Do not evaluate the stop-loss until the position has been held long
+        # enough to rule out bid-ask noise triggering an immediate exit.
+        hold_days = (datetime.now(tz=timezone.utc) - s['opened_at']).days
+        if hold_days < config.MIN_HOLD_DAYS:
+            logger.info(
+                "%s (%s): held %d day(s) — stop-loss evaluation starts after day %d",
+                sid, s['ticker'], hold_days, config.MIN_HOLD_DAYS,
+            )
             continue
 
         # Net value of the call spread (cannot be negative — the long call caps it)
@@ -535,6 +558,9 @@ def run_cycle() -> None:
         return
 
     # ── Manage open positions ──────────────────────────────────────────────────
+    # Snapshot tickers BEFORE manage_positions() so that a position closed by
+    # the stop-loss this cycle cannot be reopened in the same cycle.
+    tickers_with_positions = {s['ticker'] for s in open_strangles.values()}
     manage_positions()
 
     # ── New entries ────────────────────────────────────────────────────────────
@@ -555,8 +581,7 @@ def run_cycle() -> None:
 
     logger.info("%d slot(s) open for new strangles", available_slots)
 
-    # Avoid adding a second strangle on a ticker that already has one open
-    tickers_with_positions = {s['ticker'] for s in open_strangles.values()}
+    now_utc = datetime.now(tz=timezone.utc)
 
     for ticker in config.WATCH_LIST:
         if len(open_strangles) >= config.MAX_STRANGLES:
@@ -564,6 +589,15 @@ def run_cycle() -> None:
 
         if ticker in tickers_with_positions:
             logger.info("%s: already has an open strangle — skipping", ticker)
+            continue
+
+        # ── Cooldown check ─────────────────────────────────────────────────────
+        cooldown_until = _ticker_cooldowns.get(ticker)
+        if cooldown_until and now_utc < cooldown_until:
+            logger.info(
+                "%s: cooldown active until %s UTC — skipping",
+                ticker, cooldown_until.strftime('%Y-%m-%d %H:%M'),
+            )
             continue
 
         # ── Earnings check ─────────────────────────────────────────────────────

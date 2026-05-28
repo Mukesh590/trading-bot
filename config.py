@@ -35,10 +35,21 @@ PROFIT_TAKE_MIN_PCT = 0.50   # Close position when 50 % of max profit is in hand
 PROFIT_TAKE_MAX_PCT = 0.70   # Stretch target — accept any close between 50-70 %
 
 # Stop-loss per leg: close the WHOLE strangle if either individual leg's current
-# market value exceeds its entry credit by this fraction.
-# Example: sold a call for $2.00 per share -> stop triggers if the call is now
-# worth more than $2.20 (a $0.20 loss = 10 % of the $2.00 credit received).
-STOP_LOSS_PCT = 0.10         # 10 % of each leg's entry credit
+# market value exceeds its entry credit by this multiple.
+# Example: sold a call spread for $0.50 -> stop triggers if it is now worth
+# more than $1.50 (credit * (1 + 2.0) = 3x entry), meaning you have lost 2x
+# the collected premium on that leg.  2x-3x premium is the industry standard
+# for short-premium strategies held 30-45 DTE.
+# WARNING: values < 1.0 fire almost immediately from normal intraday fluctuation.
+STOP_LOSS_PCT = 2.0          # Stop when leg value exceeds 3x entry credit (lost 2x premium)
+
+# Minimum calendar days a position must be held before stop-loss is evaluated.
+# Prevents same-day whipsaw closes driven by bid-ask noise right after entry.
+MIN_HOLD_DAYS = 1
+
+# After any close (stop or profit), block re-entering the same ticker for this
+# many hours.  Prevents the open->stop->reopen loop that generates 24+ trades.
+TICKER_COOLDOWN_HRS = 24
 
 # ── VIX filters ────────────────────────────────────────────────────────────────
 # High-volatility environments make short premium strategies riskier.
