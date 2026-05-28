@@ -350,9 +350,9 @@ def open_strangle(ticker: str, vix: float) -> bool:
     # Step 5 — position size
     qty = config.REDUCED_CONTRACTS if vix >= config.VIX_HALF_SIZE else config.NORMAL_CONTRACTS
 
-    # Step 6 — submit all three legs
-    short_call_ok = _sell_to_open(short_call.symbol,   qty)
+    # Step 6 — submit all three legs (long call first so short is always covered)
     long_call_ok  = _buy_to_open(long_call.symbol,     qty)
+    short_call_ok = _sell_to_open(short_call.symbol,   qty)
     put_ok        = _sell_to_open(put_contract.symbol, qty)
 
     if not (short_call_ok and long_call_ok and put_ok):
