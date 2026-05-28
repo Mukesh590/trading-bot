@@ -197,6 +197,47 @@ def find_csp_contract(
     return contract
 
 
+def find_put_for_expiry(
+    ticker: str,
+    current_price: float,
+    expiry,                       # 'YYYY-MM-DD' string or datetime.date
+    trading_client: TradingClient,
+) -> Optional[object]:
+    """
+    Find a put at PUT_OTM_PCT below spot on a SPECIFIC expiration date.
+
+    Used to backfill the put leg of a spread-only strangle so the put shares the
+    call spread's expiration, completing a proper strangle.  Returns the best
+    contract on that expiry or None.
+    """
+    put_target = round(current_price * (1 - config.PUT_OTM_PCT), 2)
+    exp_date = expiry if isinstance(expiry, date) else date.fromisoformat(str(expiry))
+
+    logger.info(
+        "%s PUT backfill: spot=%.2f  put_target=%.2f  exp=%s",
+        ticker, current_price, put_target, exp_date,
+    )
+
+    try:
+        puts = _fetch_chain(ticker, 'put', exp_date, exp_date, trading_client)
+    except Exception as exc:
+        logger.error("Put backfill chain fetch failed for %s: %s", ticker, exc)
+        return None
+
+    if not puts:
+        logger.warning("%s: no puts found on %s for backfill", ticker, exp_date)
+        return None
+
+    contract = _nearest_strike(puts, put_target)
+    if contract:
+        logger.info(
+            "%s PUT backfill selected -> %s  strike=%.2f  exp=%s",
+            ticker, contract.symbol, float(contract.strike_price),
+            contract.expiration_date,
+        )
+    return contract
+
+
 def _cc_expiry_window() -> Tuple[date, date]:
     """Return (min_expiry, max_expiry) for weekly covered calls."""
     today = date.today()

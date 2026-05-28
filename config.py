@@ -42,6 +42,13 @@ CALL_SPREAD_WIDTH_DOLLARS = 25
 MIN_DTE = 30
 MAX_DTE = 45
 
+# When a strangle opens with only the call spread (the put was skipped because
+# buying power was insufficient), the bot tries to "backfill" the matching put
+# leg on a later cycle once buying power frees up — but only while the call
+# spread still has at least this many days to expiration, so the added put still
+# earns worthwhile premium.  Set to 0 to disable the hold-window guard.
+PUT_BACKFILL_MIN_DTE = 21
+
 # Maximum number of open positions at any given time, counted across the two
 # premium-selling entry strategies: call credit spreads (CCS) + cash-secured
 # puts (CSP) combined must never exceed this number.  Covered calls are EXEMPT —

@@ -39,7 +39,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Tuple
 
 import schedule
@@ -622,6 +622,102 @@ def manage_positions() -> None:
             _close_strangle(sid, spread_value_now, put_price, f"PROFIT_TAKE_{profit_pct:.1%}")
 
 
+# ── Put backfill ────────────────────────────────────────────────────────────────
+
+def backfill_puts(vix: float) -> None:
+    """
+    Complete spread-only strangles by adding the put leg when buying power frees up.
+
+    A strangle becomes spread-only when open_strangle could not afford the put's
+    collateral at entry (put_symbol is None).  For each such position that is
+    still open and still has at least PUT_BACKFILL_MIN_DTE days to expiration, we
+    sell a put at PUT_OTM_PCT below the CURRENT spot on the SAME expiration as the
+    call spread — turning the position into the full strangle that was intended.
+
+    Skips a backfill when: enough DTE is not left, earnings are near, the price /
+    chain / quote is unavailable, buying power still cannot cover the collateral,
+    or the order is rejected.  Each skip leaves the call spread untouched and the
+    position is retried next cycle.
+    """
+    for sid in list(open_strangles.keys()):
+        s = open_strangles[sid]
+        if s['put_symbol'] is not None:
+            continue  # already a full strangle
+
+        ticker = s['ticker']
+        qty    = s['contracts']
+
+        # Hold-window guard: only backfill while enough time to expiration remains.
+        try:
+            exp_date = date.fromisoformat(s['short_call_expiry'])
+        except ValueError:
+            logger.warning("%s: unparseable call expiry %r — skipping backfill",
+                           sid, s['short_call_expiry'])
+            continue
+        dte = (exp_date - date.today()).days
+        if dte < config.PUT_BACKFILL_MIN_DTE:
+            logger.info(
+                "%s (%s): spread-only but only %d DTE left (< %d) — not backfilling put",
+                sid, ticker, dte, config.PUT_BACKFILL_MIN_DTE,
+            )
+            continue
+
+        # Avoid selling a put into an imminent earnings gap.
+        if market_data.is_near_earnings(ticker, config.EARNINGS_BUFFER_DAYS):
+            logger.info("%s: near earnings — not backfilling put on %s", sid, ticker)
+            continue
+
+        price = market_data.get_current_price(ticker, stock_data_client)
+        if price is None:
+            logger.warning("%s: cannot backfill put — no price for %s", sid, ticker)
+            continue
+
+        put_contract = options_helper.find_put_for_expiry(
+            ticker, price, s['short_call_expiry'], trading_client,
+        )
+        if put_contract is None:
+            continue
+
+        collateral = float(put_contract.strike_price) * 100 * qty
+        bp = _get_buying_power()
+        if bp < collateral:
+            logger.info(
+                "%s: still insufficient buying power to backfill put "
+                "(need $%.2f, have $%.2f)",
+                sid, collateral, bp,
+            )
+            continue
+
+        put_credit = options_helper.get_option_midprice(put_contract.symbol, option_data_client)
+        if not put_credit:
+            logger.warning("%s: unusable put quote — cannot backfill this cycle", sid)
+            continue
+
+        if not _sell_to_open(put_contract.symbol, qty):
+            logger.warning("%s: put backfill order failed — leaving call spread as-is", sid)
+            continue
+
+        # Update the position in place — it is now a full strangle.
+        s['put_symbol'] = put_contract.symbol
+        s['put_strike'] = float(put_contract.strike_price)
+        s['put_expiry'] = str(put_contract.expiration_date)
+        s['put_credit'] = put_credit
+
+        trade_logger.log_trade(
+            action='OPEN', ticker=ticker, leg='PUT',
+            symbol=put_contract.symbol,
+            strike=float(put_contract.strike_price),
+            expiry=str(put_contract.expiration_date),
+            contracts=qty, entry_credit=put_credit, vix=vix,
+            notes=f"backfill into {sid}",
+        )
+        logger.info(
+            "Backfilled PUT into %s  %s  qty=%d  strike=%.2f  credit=%.4f  "
+            "collateral=$%.2f  (now a full strangle)",
+            sid, ticker, qty, float(put_contract.strike_price), put_credit, collateral,
+        )
+
+
 # ── CSP open / close ──────────────────────────────────────────────────────────
 
 def open_csp(ticker: str, vix: float) -> bool:
@@ -1035,11 +1131,14 @@ def run_cycle() -> None:
       3. Snapshot open tickers BEFORE management calls so a position closed
          this cycle cannot be reopened in the same cycle.
       4. Manage CCS strangles, CSPs, and covered calls.
-      5. Open new CCS (META/SPY/QQQ) then CSPs (MSFT/AAPL) while the capped
+      5. Backfill the put leg on any spread-only strangles whose put was skipped
+         at open for lack of buying power (not gated by the cap — completes an
+         existing position rather than opening a new one).
+      6. Open new CCS (META/SPY/QQQ) then CSPs (MSFT/AAPL) while the capped
          open-position count (CCS + CSP) stays under the cap.  The cap is
          MAX_STRANGLES normally, or VIX_ELEVATED_MAX_POSITIONS when VIX is
          elevated (>= VIX_ELEVATED).
-      6. Write covered calls on any assigned shares — NOT subject to the cap, so
+      7. Write covered calls on any assigned shares — NOT subject to the cap, so
          assigned shares are always monetised regardless of CCS/CSP count.
     """
     if not market_data.is_market_open():
@@ -1097,6 +1196,13 @@ def run_cycle() -> None:
         return
 
     now_utc = datetime.now(tz=timezone.utc)
+
+    # ── Complete spread-only strangles first ───────────────────────────────────
+    # Adding a missing put leg does not open a NEW position (the strangle is
+    # already counted), so this is not gated by the position cap.  Doing it
+    # before opening new positions lets a freed-up bit of buying power finish an
+    # existing strangle rather than start another.
+    backfill_puts(vix)
 
     # ── Position cap (CCS + CSP only) ──────────────────────────────────────────
     # The cap governs how many CCS + CSP positions may be open at once.  Covered
