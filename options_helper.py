@@ -71,18 +71,22 @@ def _nearest_strike(contracts: list, target_strike: float) -> Optional[object]:
 
 def _find_long_call(calls: list, short_call: object) -> Optional[object]:
     """
-    Return the call that is CALL_SPREAD_WIDTH strikes above short_call on the
-    same expiration date — this is the hedge (long) leg of the call credit spread.
+    Return the hedge (long) leg of the call credit spread: the call on the same
+    expiration date whose strike is closest to CALL_SPREAD_WIDTH_DOLLARS above
+    the short-call strike.
+
+    Using a dollar width rather than a fixed strike count makes the spread width
+    consistent across underlyings with different strike spacing (SPY/QQQ at $1,
+    META at $5).  Any strike strictly above the short call qualifies, so this
+    only returns None when there is no higher strike at all in the chain.
     """
     same_expiry = [c for c in calls if c.expiration_date == short_call.expiration_date]
     short_strike = float(short_call.strike_price)
-    higher = sorted(
-        [c for c in same_expiry if float(c.strike_price) > short_strike],
-        key=lambda c: float(c.strike_price),
-    )
-    if len(higher) < config.CALL_SPREAD_WIDTH:
+    target_strike = short_strike + config.CALL_SPREAD_WIDTH_DOLLARS
+    higher = [c for c in same_expiry if float(c.strike_price) > short_strike]
+    if not higher:
         return None
-    return higher[config.CALL_SPREAD_WIDTH - 1]
+    return min(higher, key=lambda c: abs(float(c.strike_price) - target_strike))
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -98,8 +102,8 @@ def find_strangle_contracts(
 
     Selection logic:
       • Short call target = current_price * (1 + CALL_OTM_PCT)
-      • Long  call        = CALL_SPREAD_WIDTH strikes above the short call,
-                            same expiration (caps the upside risk)
+      • Long  call        = strike closest to CALL_SPREAD_WIDTH_DOLLARS above the
+                            short call, same expiration (caps the upside risk)
       • Put   target      = current_price * (1 - PUT_OTM_PCT)
       • All contracts must expire between MIN_DTE and MAX_DTE days from today
 
@@ -139,9 +143,9 @@ def find_strangle_contracts(
     long_call = _find_long_call(calls, short_call)
     if long_call is None:
         logger.warning(
-            "%s: could not find a long call %d strikes above %.2f — "
-            "chain may not have enough strikes in this DTE window",
-            ticker, config.CALL_SPREAD_WIDTH, float(short_call.strike_price),
+            "%s: could not find any call strike above %.2f (~$%d-wide target) — "
+            "chain may not have higher strikes in this DTE window",
+            ticker, float(short_call.strike_price), config.CALL_SPREAD_WIDTH_DOLLARS,
         )
         return None
 

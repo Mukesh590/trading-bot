@@ -28,7 +28,13 @@ ETF_TICKERS = ['SPY', 'QQQ']
 # the current stock price.
 CALL_OTM_PCT      = 0.025   # Sell call ~2.5 % above spot
 PUT_OTM_PCT       = 0.025   # Sell put  ~2.5 % below spot
-CALL_SPREAD_WIDTH = 5       # Buy a call this many strikes above the short call to cap risk
+
+# Width of the call credit spread, in DOLLARS above the short-call strike (not a
+# fixed number of strikes).  A dollar width works across underlyings regardless
+# of their strike spacing: SPY/QQQ use $1 increments while META uses $5, so a
+# fixed "5 strikes" gave a $5 spread on the ETFs but $25 on META.  We pick the
+# strike closest to (short_strike + CALL_SPREAD_WIDTH_DOLLARS) for every ticker.
+CALL_SPREAD_WIDTH_DOLLARS = 25
 
 # Days-to-expiration (DTE) target window.  Contracts must expire between
 # MIN_DTE and MAX_DTE days from today.  The 30-45 day range captures the

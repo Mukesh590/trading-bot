@@ -8,9 +8,10 @@ level is reached.
 Strategy rules
 --------------
   Tickers        : CCS on META, SPY, QQQ;  CSP/wheel on MSFT, AAPL
-  Call leg       : Sell call ≈ 2.5 % above spot; buy call CALL_SPREAD_WIDTH strikes
+  Call leg       : Sell call ≈ 2.5 % above spot; buy call ≈ CALL_SPREAD_WIDTH_DOLLARS
                    higher on the same expiry to cap upside risk (credit spread)
-  Put  leg       : Sell put  ≈ 2.5 % below current spot (cash-secured)
+  Put  leg       : Sell put  ≈ 2.5 % below current spot (cash-secured); opens
+                   independently and is skipped if buying power is insufficient
   DTE window     : 30 – 45 days to expiration
   Max open       : 3 concurrent CCS + CSP positions (covered calls are exempt)
   Profit target  : Close when >= 50 % of max profit is captured (up to 70 % ideal)
@@ -299,7 +300,10 @@ def _reconcile_positions() -> None:
         s = open_strangles[sid]
         short_call_live = s['short_call_symbol'] in live_symbols
         long_call_live  = s['long_call_symbol']  in live_symbols
-        put_live        = s['put_symbol']         in live_symbols
+        # A spread-only position has put_symbol=None; treat its (absent) put as
+        # "live" so it never counts as a missing leg or triggers removal.
+        has_put  = s['put_symbol'] is not None
+        put_live = (s['put_symbol'] in live_symbols) if has_put else True
 
         if not short_call_live and not long_call_live and not put_live:
             logger.warning(
@@ -308,13 +312,13 @@ def _reconcile_positions() -> None:
             )
             del open_strangles[sid]
         else:
-            missing = [
-                sym for sym, live in [
-                    (s['short_call_symbol'], short_call_live),
-                    (s['long_call_symbol'],  long_call_live),
-                    (s['put_symbol'],        put_live),
-                ] if not live
+            legs = [
+                (s['short_call_symbol'], short_call_live),
+                (s['long_call_symbol'],  long_call_live),
             ]
+            if has_put:
+                legs.append((s['put_symbol'], put_live))
+            missing = [sym for sym, live in legs if not live]
             if missing:
                 logger.warning(
                     "Position %s (%s): leg(s) %s missing from account — "
@@ -329,19 +333,25 @@ def open_strangle(ticker: str, vix: float) -> bool:
     """
     Attempt to open a call credit spread + cash-secured put on `ticker`.
 
+    The two sides are INDEPENDENT: the call credit spread and the cash-secured
+    put open separately.  If buying power is insufficient for the put (or its
+    quote/order fails), the call spread is still opened and tracked on its own.
+    The position is abandoned only if the call spread itself cannot be opened.
+
     Flow:
       1. Fetch the current stock price.
       2. Find the short call, long call (hedge), and put contracts in the 30–45 DTE window.
-      3. Get bid-ask midpoints for all three legs.
-      4. Verify the call spread yields a positive net credit.
-      5. Set contract quantity (always NORMAL_CONTRACTS; elevated VIX limits the
+      3. Price and validate the call spread (positive net credit required).
+      4. Set contract quantity (always NORMAL_CONTRACTS; elevated VIX limits the
          number of open positions, not the contract count — see run_cycle).
-      6. Submit three orders: buy the long call FIRST (and confirm it), then sell
-         the short call and the put.  This keeps the short call covered at all
-         times.  If any order fails, roll back all submitted legs.
+      5. Open the call spread: buy the long call FIRST (and confirm it), then sell
+         the short call.  This keeps the short call covered at all times.  Roll
+         back the long call if the short call fails.
+      6. Open the put as an independent leg ONLY if buying power covers the
+         collateral.  Insufficient buying power skips the put, not the spread.
       7. Record the position in memory and write to the CSV log.
 
-    Returns True when all three legs are submitted successfully.
+    Returns True when at least the call spread is opened.
     """
     # Step 1 — stock price
     price = market_data.get_current_price(ticker, stock_data_client)
@@ -355,19 +365,17 @@ def open_strangle(ticker: str, vix: float) -> bool:
         return False
     short_call, long_call, put_contract = triple
 
-    # Step 3 — price all three legs
-    short_call_credit = options_helper.get_option_midprice(short_call.symbol,    option_data_client)
-    long_call_debit   = options_helper.get_option_midprice(long_call.symbol,     option_data_client)
-    put_credit        = options_helper.get_option_midprice(put_contract.symbol,  option_data_client)
+    # Step 3 — price and validate the call spread (the put is priced later)
+    short_call_credit = options_helper.get_option_midprice(short_call.symbol, option_data_client)
+    long_call_debit   = options_helper.get_option_midprice(long_call.symbol,  option_data_client)
 
-    if not short_call_credit or not long_call_debit or not put_credit:
+    if not short_call_credit or not long_call_debit:
         logger.warning(
-            "%s: unusable quotes — short_call=%s  long_call=%s  put=%s — skipping",
-            ticker, short_call_credit, long_call_debit, put_credit,
+            "%s: unusable call-spread quotes — short_call=%s  long_call=%s — skipping",
+            ticker, short_call_credit, long_call_debit,
         )
         return False
 
-    # Step 4 — verify the spread has a positive net credit
     call_spread_credit = round(short_call_credit - long_call_debit, 4)
     if call_spread_credit <= 0:
         logger.warning(
@@ -376,35 +384,48 @@ def open_strangle(ticker: str, vix: float) -> bool:
         )
         return False
 
-    # Step 5 — position size (always full size; elevated VIX limits the NUMBER
+    # Step 4 — position size (always full size; elevated VIX limits the NUMBER
     # of open positions instead of shrinking contract count — see run_cycle)
     qty = config.NORMAL_CONTRACTS
 
-    # Step 6 — submit all three legs.
+    # Step 5 — open the call spread.
     # ORDER MATTERS: buy the long (hedge) call FIRST and confirm it was accepted
     # before selling the short call.  This guarantees the short call is never
     # left uncovered, which is what triggers the broker's "not eligible to trade
-    # uncovered option contracts" rejection.  Abort the short call if the long
-    # call did not go through.
-    long_call_ok = _buy_to_open(long_call.symbol, qty)
-    if not long_call_ok:
+    # uncovered option contracts" rejection.
+    if not _buy_to_open(long_call.symbol, qty):
         logger.error(
             "%s: long call did not submit — refusing to sell an uncovered short call",
             ticker,
         )
         return False
-    short_call_ok = _sell_to_open(short_call.symbol,   qty)
-    put_ok        = _sell_to_open(put_contract.symbol, qty)
-
-    if not (short_call_ok and long_call_ok and put_ok):
-        logger.error("%s: partial fill — rolling back submitted leg(s) for safety", ticker)
-        if short_call_ok:
-            _buy_to_close(short_call.symbol,  qty)
-        if long_call_ok:
-            _sell_to_close(long_call.symbol,  qty)
-        if put_ok:
-            _buy_to_close(put_contract.symbol, qty)
+    if not _sell_to_open(short_call.symbol, qty):
+        logger.error("%s: short call failed — rolling back the long call", ticker)
+        _sell_to_close(long_call.symbol, qty)
         return False
+
+    # Step 6 — open the put as an INDEPENDENT leg.  A cash-secured put needs
+    # strike * 100 * qty in buying power; if we cannot cover it (or the quote /
+    # order fails), keep the call spread open and proceed without the put.
+    put_credit  = 0.0
+    put_opened  = False
+    put_collateral = float(put_contract.strike_price) * 100 * qty
+    bp = _get_buying_power()
+    if bp < put_collateral:
+        logger.warning(
+            "%s: insufficient buying power for put leg (need $%.2f, have $%.2f) — "
+            "opening call spread only",
+            ticker, put_collateral, bp,
+        )
+    else:
+        quoted = options_helper.get_option_midprice(put_contract.symbol, option_data_client)
+        if not quoted:
+            logger.warning("%s: unusable put quote — opening call spread only", ticker)
+        elif _sell_to_open(put_contract.symbol, qty):
+            put_credit = quoted
+            put_opened = True
+        else:
+            logger.warning("%s: put order failed — opening call spread only", ticker)
 
     # Step 7 — record
     sid = _new_strangle_id(ticker)
@@ -412,13 +433,13 @@ def open_strangle(ticker: str, vix: float) -> bool:
         'ticker':             ticker,
         'short_call_symbol':  short_call.symbol,
         'long_call_symbol':   long_call.symbol,
-        'put_symbol':         put_contract.symbol,
+        'put_symbol':         put_contract.symbol if put_opened else None,
         'short_call_strike':  float(short_call.strike_price),
         'long_call_strike':   float(long_call.strike_price),
-        'put_strike':         float(put_contract.strike_price),
+        'put_strike':         float(put_contract.strike_price) if put_opened else 0.0,
         'short_call_expiry':  str(short_call.expiration_date),
         'long_call_expiry':   str(long_call.expiration_date),
-        'put_expiry':         str(put_contract.expiration_date),
+        'put_expiry':         str(put_contract.expiration_date) if put_opened else None,
         'short_call_credit':  short_call_credit,
         'long_call_debit':    long_call_debit,
         'call_spread_credit': call_spread_credit,
@@ -428,7 +449,7 @@ def open_strangle(ticker: str, vix: float) -> bool:
         'opened_at':          datetime.now(tz=timezone.utc),
     }
 
-    # Log as CALL_SPREAD (net credit) + PUT to the CSV
+    # Log the CALL_SPREAD (net credit), plus the PUT only if it actually opened
     trade_logger.log_trade(
         action='OPEN', ticker=ticker, leg='CALL_SPREAD',
         symbol=short_call.symbol,
@@ -437,23 +458,30 @@ def open_strangle(ticker: str, vix: float) -> bool:
         contracts=qty, entry_credit=call_spread_credit, vix=vix,
         notes=f"long={long_call.symbol}@{long_call_debit:.4f}",
     )
-    trade_logger.log_trade(
-        action='OPEN', ticker=ticker, leg='PUT',
-        symbol=put_contract.symbol,
-        strike=float(put_contract.strike_price),
-        expiry=str(put_contract.expiration_date),
-        contracts=qty, entry_credit=put_credit, vix=vix,
-    )
+    if put_opened:
+        trade_logger.log_trade(
+            action='OPEN', ticker=ticker, leg='PUT',
+            symbol=put_contract.symbol,
+            strike=float(put_contract.strike_price),
+            expiry=str(put_contract.expiration_date),
+            contracts=qty, entry_credit=put_credit, vix=vix,
+        )
 
     net_credit_dollars = (call_spread_credit + put_credit) * qty * 100
-    logger.info(
-        "Opened %s  %s  qty=%d  "
-        "spread=%s/+%s net=%.2f  put=%s@%.2f  total_credit=$%.2f",
-        sid, ticker, qty,
-        short_call.symbol, long_call.symbol, call_spread_credit,
-        put_contract.symbol, put_credit,
-        net_credit_dollars,
-    )
+    if put_opened:
+        logger.info(
+            "Opened %s  %s  qty=%d  spread=%s/+%s net=%.2f  put=%s@%.2f  total_credit=$%.2f",
+            sid, ticker, qty,
+            short_call.symbol, long_call.symbol, call_spread_credit,
+            put_contract.symbol, put_credit, net_credit_dollars,
+        )
+    else:
+        logger.info(
+            "Opened %s  %s  qty=%d  spread=%s/+%s net=%.2f  put=SKIPPED  total_credit=$%.2f",
+            sid, ticker, qty,
+            short_call.symbol, long_call.symbol, call_spread_credit,
+            net_credit_dollars,
+        )
     return True
 
 
@@ -466,18 +494,20 @@ def _close_strangle(
     reason: str,
 ) -> None:
     """
-    Close all three legs of a position, log the result, and remove it from the tracker.
+    Close the position's legs, log the result, and remove it from the tracker.
 
     spread_debit  — net cost to close the call spread (short_call_price - long_call_price).
                     Buy back the short call and sell the long call.
-    put_debit     — market price to buy back the put.
+    put_debit     — market price to buy back the put (ignored if no put leg).
     """
     s   = open_strangles[sid]
     qty = s['contracts']
+    has_put = s['put_symbol'] is not None
 
     _buy_to_close(s['short_call_symbol'],  qty)
     _sell_to_close(s['long_call_symbol'],  qty)
-    _buy_to_close(s['put_symbol'],         qty)
+    if has_put:
+        _buy_to_close(s['put_symbol'], qty)
 
     trade_logger.log_trade(
         action='CLOSE', ticker=s['ticker'], leg='CALL_SPREAD',
@@ -487,17 +517,18 @@ def _close_strangle(
         contracts=qty, entry_credit=s['call_spread_credit'],
         exit_debit=spread_debit, vix=s['vix_at_entry'], notes=reason,
     )
-    trade_logger.log_trade(
-        action='CLOSE', ticker=s['ticker'], leg='PUT',
-        symbol=s['put_symbol'],
-        strike=s['put_strike'],
-        expiry=s['put_expiry'],
-        contracts=qty, entry_credit=s['put_credit'],
-        exit_debit=put_debit, vix=s['vix_at_entry'], notes=reason,
-    )
+    if has_put:
+        trade_logger.log_trade(
+            action='CLOSE', ticker=s['ticker'], leg='PUT',
+            symbol=s['put_symbol'],
+            strike=s['put_strike'],
+            expiry=s['put_expiry'],
+            contracts=qty, entry_credit=s['put_credit'],
+            exit_debit=put_debit, vix=s['vix_at_entry'], notes=reason,
+        )
 
     spread_pnl = (s['call_spread_credit'] - spread_debit) * qty * 100
-    put_pnl    = (s['put_credit']          - put_debit)   * qty * 100
+    put_pnl    = (s['put_credit'] - put_debit) * qty * 100 if has_put else 0.0
     logger.info(
         "Closed %s  reason=%-25s  spread_pnl=$%.2f  put_pnl=$%.2f  total=$%.2f",
         sid, reason, spread_pnl, put_pnl, spread_pnl + put_pnl,
@@ -529,20 +560,31 @@ def manage_positions() -> None:
     Stop-loss logic:
       Call side — close if the spread value exceeds call_spread_credit * (1 + STOP_LOSS_PCT).
       Put  side — close if put_price exceeds put_credit * (1 + STOP_LOSS_PCT).
-      Either trigger closes the full position (all three legs).
+      Either trigger closes the whole position.
+
+    Spread-only positions (put_symbol is None) are managed on the call spread
+    alone: the put price/credit are treated as zero throughout.
     """
     _reconcile_positions()
 
     for sid in list(open_strangles.keys()):
         s = open_strangles[sid]
+        has_put = s['put_symbol'] is not None
 
         short_call_price = options_helper.get_option_midprice(s['short_call_symbol'], option_data_client)
         long_call_price  = options_helper.get_option_midprice(s['long_call_symbol'],  option_data_client)
-        put_price        = options_helper.get_option_midprice(s['put_symbol'],        option_data_client)
 
-        if short_call_price is None or long_call_price is None or put_price is None:
-            logger.warning("%s: could not price all legs this cycle — skipping", sid)
+        if short_call_price is None or long_call_price is None:
+            logger.warning("%s: could not price call spread this cycle — skipping", sid)
             continue
+
+        if has_put:
+            put_price = options_helper.get_option_midprice(s['put_symbol'], option_data_client)
+            if put_price is None:
+                logger.warning("%s: could not price put this cycle — skipping", sid)
+                continue
+        else:
+            put_price = 0.0
 
         # Do not evaluate the stop-loss until the position has been held long
         # enough to rule out bid-ask noise triggering an immediate exit.
@@ -562,7 +604,7 @@ def manage_positions() -> None:
         profit_pct    = (total_credit - total_current) / total_credit
 
         spread_stop = spread_value_now > s['call_spread_credit'] * (1 + config.STOP_LOSS_PCT)
-        put_stop    = put_price        > s['put_credit']         * (1 + config.STOP_LOSS_PCT)
+        put_stop    = has_put and put_price > s['put_credit'] * (1 + config.STOP_LOSS_PCT)
 
         logger.debug(
             "%s  spread=%.4f/%.4f(stop=%s)  put=%.4f/%.4f(stop=%s)  profit=%.1f%%",
@@ -1149,8 +1191,8 @@ def main() -> None:
     logger.info("  --- Call Credit Spread strategy (CCS) ---")
     logger.info("  Tickers      : %s", ', '.join(config.CCS_TICKERS))
     logger.info("  DTE window   : %d-%d days", config.MIN_DTE, config.MAX_DTE)
-    logger.info("  Call spread  : Sell %.1f%% OTM; buy %d strikes higher",
-                config.CALL_OTM_PCT * 100, config.CALL_SPREAD_WIDTH)
+    logger.info("  Call spread  : Sell %.1f%% OTM; buy ~$%d higher",
+                config.CALL_OTM_PCT * 100, config.CALL_SPREAD_WIDTH_DOLLARS)
     logger.info("  Put leg      : Sell %.1f%% OTM", config.PUT_OTM_PCT * 100)
     logger.info("  Max open     : %d (CCS + CSP combined; covered calls exempt)", config.MAX_STRANGLES)
     logger.info("  --- Cash-Secured Put + Wheel strategy (CSP) ---")
