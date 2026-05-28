@@ -9,9 +9,19 @@ this file — no magic numbers should appear anywhere else in the codebase.
 # CCS tickers run the call credit spread + put strangle (original strategy).
 # CSP tickers run the wheel strategy: sell cash-secured put → if assigned,
 # sell covered calls until shares are called away.
-CCS_TICKERS = ['AMZN', 'META']
+#
+# SPY and QQQ replace AMZN here: AMZN repeatedly failed with "account not
+# eligible to trade uncovered option contracts", and these broad ETFs have
+# deeper, tighter options chains that work with our account level.  Their
+# percentage-based strike selection (see options_helper) is price-agnostic, so
+# the same OTM % and spread-width rules apply cleanly to ETF prices.
+CCS_TICKERS = ['META', 'SPY', 'QQQ']
 CSP_TICKERS = ['MSFT', 'AAPL']
 WATCH_LIST  = CCS_TICKERS + CSP_TICKERS   # kept for logging convenience
+
+# ETFs do not report earnings, so the earnings-avoidance gate must not skip
+# them (an unknown earnings date would otherwise be treated as "too close").
+ETF_TICKERS = ['SPY', 'QQQ']
 
 # ── Call credit spread + put strangle construction (CCS_TICKERS) ───────────────
 # How far out-of-the-money (OTM) to sell each leg, expressed as a fraction of
@@ -26,8 +36,10 @@ CALL_SPREAD_WIDTH = 5       # Buy a call this many strikes above the short call 
 MIN_DTE = 30
 MAX_DTE = 45
 
-# Maximum number of open strangles at any given time (across all tickers).
-# Limits capital at risk and keeps margin usage manageable.
+# Maximum number of open positions at any given time, counted GLOBALLY across
+# every strategy: call credit spreads (CCS) + cash-secured puts (CSP) +
+# covered calls (CC) combined must never exceed this number.  Limits capital at
+# risk and keeps margin usage manageable.
 MAX_STRANGLES = 3
 
 # ── Profit / loss management ───────────────────────────────────────────────────
@@ -68,8 +80,11 @@ CC_MAX_DTE     = 9          # Cap at 9 days to stay in the weekly window
 
 # ── VIX filters ────────────────────────────────────────────────────────────────
 # High-volatility environments make short premium strategies riskier.
-VIX_NO_TRADE  = 40.0   # Do NOT open new strangles when VIX is at or above this level
-VIX_HALF_SIZE = 30.0   # Trade at half the normal contract count when VIX is this high
+VIX_NO_TRADE     = 40.0   # Do NOT open new positions when VIX is at or above this level
+VIX_ELEVATED     = 30.0   # When VIX is in [VIX_ELEVATED, VIX_NO_TRADE), cap total open
+                          # positions at VIX_ELEVATED_MAX_POSITIONS (full contract size).
+VIX_ELEVATED_MAX_POSITIONS = 1   # Open only ONE position while VIX is elevated, rather
+                                 # than trading reduced size across several — simpler logic.
 
 # ── Earnings avoidance ─────────────────────────────────────────────────────────
 # Earnings announcements cause large gap moves that can blow through our strikes.
@@ -77,9 +92,10 @@ VIX_HALF_SIZE = 30.0   # Trade at half the normal contract count when VIX is thi
 EARNINGS_BUFFER_DAYS = 7
 
 # ── Position sizing ────────────────────────────────────────────────────────────
-# Each contract controls 100 shares of the underlying.
-NORMAL_CONTRACTS  = 2   # Standard qty per leg (VIX < VIX_HALF_SIZE)
-REDUCED_CONTRACTS = 1   # Half-size qty per leg (VIX >= VIX_HALF_SIZE)
+# Each contract controls 100 shares of the underlying.  We always trade the same
+# contract count per leg; elevated VIX is handled by limiting the NUMBER of open
+# positions (see VIX_ELEVATED_MAX_POSITIONS), not by shrinking contract size.
+NORMAL_CONTRACTS  = 2   # Standard qty per leg
 
 # ── Scheduler ──────────────────────────────────────────────────────────────────
 CHECK_INTERVAL_MIN  = 30   # Run the main strategy loop every N minutes

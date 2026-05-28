@@ -16,6 +16,8 @@ import yfinance as yf
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
+import config
+
 logger = logging.getLogger(__name__)
 
 _EASTERN = pytz.timezone('America/New_York')
@@ -112,7 +114,13 @@ def is_near_earnings(ticker: str, buffer_days: int) -> bool:
     When the earnings date cannot be determined we err on the side of caution
     and return True so the ticker is skipped — better to miss a trade than to
     hold a short strangle through a gap-move earnings announcement.
+
+    ETFs (e.g. SPY, QQQ) hold baskets of stocks and never report earnings, so
+    they are never "near earnings" — return False so they remain tradeable.
     """
+    if ticker in config.ETF_TICKERS:
+        return False
+
     next_date = get_next_earnings_date(ticker)
     if next_date is None:
         logger.warning("%s: earnings date unknown — skipping to be safe", ticker)

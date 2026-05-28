@@ -7,16 +7,16 @@ level is reached.
 
 Strategy rules
 --------------
-  Tickers        : MSFT, AAPL, AMZN, META
+  Tickers        : CCS on META, SPY, QQQ;  CSP/wheel on MSFT, AAPL
   Call leg       : Sell call ≈ 2.5 % above spot; buy call CALL_SPREAD_WIDTH strikes
                    higher on the same expiry to cap upside risk (credit spread)
   Put  leg       : Sell put  ≈ 2.5 % below current spot (cash-secured)
   DTE window     : 30 – 45 days to expiration
-  Max open       : 3 concurrent positions (one per ticker)
+  Max open       : 3 concurrent positions GLOBALLY (CCS + CSP + CC combined)
   Profit target  : Close when >= 50 % of max profit is captured (up to 70 % ideal)
   Stop loss      : Close entire position if call spread value or put value exceeds
                    entry credit * 1.10
-  VIX gate       : No new trades when VIX >= 40; half position size when VIX >= 30
+  VIX gate       : No new trades when VIX >= 40; cap to 1 open position when VIX >= 30
   Earnings gate  : Skip a ticker if earnings fall within the next 7 days
   Schedule       : Every 30 minutes during regular market hours (9:30 – 16:00 ET)
 
@@ -155,6 +155,31 @@ def _get_buying_power() -> float:
     except Exception as exc:
         logger.error("Could not fetch buying power: %s", exc)
         return 0.0
+
+
+def _total_open_positions() -> int:
+    """
+    Total number of open positions counted GLOBALLY across every strategy:
+    call credit spreads (CCS) + cash-secured puts (CSP) + covered calls (CC).
+
+    This is the single source of truth for the MAX_STRANGLES capacity check, so
+    that, e.g., two CSPs on MSFT/AAPL plus one CCS already fills all three slots
+    and no fourth position of any type can be opened.
+    """
+    return len(open_strangles) + len(open_csps) + len(open_covered_calls)
+
+
+def _prune_stale_cooldowns() -> None:
+    """
+    Drop cooldown entries for tickers no longer in any watchlist.
+
+    After removing a ticker (e.g. AMZN) from the watchlists, any lingering
+    cooldown entry for it is meaningless and should not be carried around.
+    """
+    stale = [t for t in _ticker_cooldowns if t not in config.WATCH_LIST]
+    for ticker in stale:
+        del _ticker_cooldowns[ticker]
+        logger.info("Cleared stale cooldown for de-listed ticker %s", ticker)
 
 
 def _new_strangle_id(ticker: str) -> str:
@@ -307,9 +332,11 @@ def open_strangle(ticker: str, vix: float) -> bool:
       2. Find the short call, long call (hedge), and put contracts in the 30–45 DTE window.
       3. Get bid-ask midpoints for all three legs.
       4. Verify the call spread yields a positive net credit.
-      5. Set contract quantity (halved when VIX >= VIX_HALF_SIZE).
-      6. Submit three orders (sell short call, buy long call, sell put).
-         If any order fails, roll back all submitted legs to avoid partial exposure.
+      5. Set contract quantity (always NORMAL_CONTRACTS; elevated VIX limits the
+         number of open positions, not the contract count — see run_cycle).
+      6. Submit three orders: buy the long call FIRST (and confirm it), then sell
+         the short call and the put.  This keeps the short call covered at all
+         times.  If any order fails, roll back all submitted legs.
       7. Record the position in memory and write to the CSV log.
 
     Returns True when all three legs are submitted successfully.
@@ -347,11 +374,23 @@ def open_strangle(ticker: str, vix: float) -> bool:
         )
         return False
 
-    # Step 5 — position size
-    qty = config.REDUCED_CONTRACTS if vix >= config.VIX_HALF_SIZE else config.NORMAL_CONTRACTS
+    # Step 5 — position size (always full size; elevated VIX limits the NUMBER
+    # of open positions instead of shrinking contract count — see run_cycle)
+    qty = config.NORMAL_CONTRACTS
 
-    # Step 6 — submit all three legs (long call first so short is always covered)
-    long_call_ok  = _buy_to_open(long_call.symbol,     qty)
+    # Step 6 — submit all three legs.
+    # ORDER MATTERS: buy the long (hedge) call FIRST and confirm it was accepted
+    # before selling the short call.  This guarantees the short call is never
+    # left uncovered, which is what triggers the broker's "not eligible to trade
+    # uncovered option contracts" rejection.  Abort the short call if the long
+    # call did not go through.
+    long_call_ok = _buy_to_open(long_call.symbol, qty)
+    if not long_call_ok:
+        logger.error(
+            "%s: long call did not submit — refusing to sell an uncovered short call",
+            ticker,
+        )
+        return False
     short_call_ok = _sell_to_open(short_call.symbol,   qty)
     put_ok        = _sell_to_open(put_contract.symbol, qty)
 
@@ -555,7 +594,7 @@ def open_csp(ticker: str, vix: float) -> bool:
         logger.warning("%s CSP: skipping — could not fetch price", ticker)
         return False
 
-    qty = config.REDUCED_CONTRACTS if vix >= config.VIX_HALF_SIZE else config.NORMAL_CONTRACTS
+    qty = config.NORMAL_CONTRACTS
     approx_strike = round(price * (1 - config.CSP_OTM_PCT), 2)
     required = approx_strike * 100 * qty
 
@@ -952,10 +991,12 @@ def run_cycle() -> None:
       3. Snapshot open tickers BEFORE management calls so a position closed
          this cycle cannot be reopened in the same cycle.
       4. Manage CCS strangles, CSPs, and covered calls.
-      5. Open new CCS strangles (AMZN/META) up to MAX_STRANGLES.
-      6. Open new CSPs (MSFT/AAPL) if buying power allows.
-      7. Open new covered calls against any assigned shares.
-         Covered calls do NOT count toward MAX_STRANGLES.
+      5. Open new positions (CCS on META/SPY/QQQ, then CSPs on MSFT/AAPL, then
+         covered calls on assigned shares) while the GLOBAL open-position count
+         stays under the cap.  The cap is MAX_STRANGLES normally, or
+         VIX_ELEVATED_MAX_POSITIONS when VIX is elevated (>= VIX_ELEVATED).
+         Every position type — CCS, CSP and CC — counts toward this single cap,
+         so the total can never exceed it.
     """
     if not market_data.is_market_open():
         logger.debug("Market closed — no action this cycle")
@@ -1013,32 +1054,55 @@ def run_cycle() -> None:
 
     now_utc = datetime.now(tz=timezone.utc)
 
-    # ── New CCS strangles (AMZN, META) ────────────────────────────────────────
-    ccs_slots = config.MAX_STRANGLES - len(open_strangles)
-    if ccs_slots > 0:
-        logger.info("%d CCS slot(s) available", ccs_slots)
-        for ticker in config.CCS_TICKERS:
-            if len(open_strangles) >= config.MAX_STRANGLES:
-                break
-            if ticker in tickers_with_strangles:
-                logger.info("%s: CCS already open — skipping", ticker)
-                continue
-            cooldown_until = _ticker_cooldowns.get(ticker)
-            if cooldown_until and now_utc < cooldown_until:
-                logger.info("%s: CCS cooldown until %s UTC — skipping",
-                            ticker, cooldown_until.strftime('%Y-%m-%d %H:%M'))
-                continue
-            if market_data.is_near_earnings(ticker, config.EARNINGS_BUFFER_DAYS):
-                logger.info("%s: near earnings — skipping CCS", ticker)
-                continue
-            logger.info("Attempting CCS on %s (VIX=%.2f)", ticker, vix)
-            open_strangle(ticker, vix)
+    # ── Global position cap ────────────────────────────────────────────────────
+    # A SINGLE cap governs how many positions of ANY type may be open at once.
+    # When VIX is elevated (>= VIX_ELEVATED but < VIX_NO_TRADE) we allow only
+    # VIX_ELEVATED_MAX_POSITIONS open at once — one position, full size — rather
+    # than trading reduced contract counts across several.
+    if vix >= config.VIX_ELEVATED:
+        position_cap = config.VIX_ELEVATED_MAX_POSITIONS
+        logger.info(
+            "VIX %.2f >= elevated threshold (%.0f) — capping total open positions at %d",
+            vix, config.VIX_ELEVATED, position_cap,
+        )
     else:
-        logger.info("CCS at capacity (%d/%d) — no new entries",
-                    len(open_strangles), config.MAX_STRANGLES)
+        position_cap = config.MAX_STRANGLES
+
+    def _at_capacity() -> bool:
+        """True when no further positions of any type may be opened this cycle."""
+        if _total_open_positions() >= position_cap:
+            logger.info(
+                "At global position cap (%d/%d open: CCS=%d CSP=%d CC=%d) — no new entries",
+                _total_open_positions(), position_cap,
+                len(open_strangles), len(open_csps), len(open_covered_calls),
+            )
+            return True
+        return False
+
+    # ── New CCS strangles (META, SPY, QQQ) ────────────────────────────────────
+    for ticker in config.CCS_TICKERS:
+        if _at_capacity():
+            break
+        if ticker in tickers_with_strangles:
+            logger.info("%s: CCS already open — skipping", ticker)
+            continue
+        cooldown_until = _ticker_cooldowns.get(ticker)
+        if cooldown_until and now_utc < cooldown_until:
+            logger.info("%s: CCS cooldown until %s UTC — skipping",
+                        ticker, cooldown_until.strftime('%Y-%m-%d %H:%M'))
+            continue
+        if market_data.is_near_earnings(ticker, config.EARNINGS_BUFFER_DAYS):
+            logger.info("%s: near earnings — skipping CCS", ticker)
+            continue
+        logger.info("Attempting CCS on %s (VIX=%.2f)", ticker, vix)
+        open_strangle(ticker, vix)
 
     # ── New CSPs (MSFT, AAPL) ─────────────────────────────────────────────────
+    # CSPs count toward the same global cap as CCS, so an open CSP on MSFT/AAPL
+    # consumes a slot that a CCS would otherwise use (and vice versa).
     for ticker in config.CSP_TICKERS:
+        if _at_capacity():
+            break
         if ticker in tickers_with_csps:
             logger.info("%s: CSP already open — skipping", ticker)
             continue
@@ -1054,9 +1118,13 @@ def run_cycle() -> None:
         open_csp(ticker, vix)
 
     # ── Covered calls on assigned shares ──────────────────────────────────────
-    # Not subject to MAX_STRANGLES or cooldown — we always want to monetise
-    # shares we've been assigned.
+    # Covered calls also count toward the global cap.  Note the wheel is
+    # self-balancing here: a CSP that gets assigned is removed from open_csps
+    # (freeing its slot) before its covered call is written, so monetising
+    # assigned shares does not by itself push the total over the cap.
     for ticker in list(assigned_shares.keys()):
+        if _at_capacity():
+            break
         if ticker in tickers_with_covered_calls:
             logger.info("%s: CC already open — skipping", ticker)
             continue
@@ -1067,9 +1135,10 @@ def run_cycle() -> None:
         open_covered_call(ticker)
 
     logger.info(
-        "=== Cycle end | CCS=%d/%d  CSP=%d  CC=%d  assigned=%d ===",
-        len(open_strangles), config.MAX_STRANGLES,
-        len(open_csps), len(open_covered_calls), len(assigned_shares),
+        "=== Cycle end | total=%d/%d (CCS=%d CSP=%d CC=%d)  assigned=%d ===",
+        _total_open_positions(), position_cap,
+        len(open_strangles), len(open_csps), len(open_covered_calls),
+        len(assigned_shares),
     )
 
 
@@ -1084,7 +1153,7 @@ def main() -> None:
     logger.info("  Call spread  : Sell %.1f%% OTM; buy %d strikes higher",
                 config.CALL_OTM_PCT * 100, config.CALL_SPREAD_WIDTH)
     logger.info("  Put leg      : Sell %.1f%% OTM", config.PUT_OTM_PCT * 100)
-    logger.info("  Max CCS open : %d", config.MAX_STRANGLES)
+    logger.info("  Max open     : %d (GLOBAL — CCS + CSP + CC combined)", config.MAX_STRANGLES)
     logger.info("  --- Cash-Secured Put + Wheel strategy (CSP) ---")
     logger.info("  Tickers      : %s", ', '.join(config.CSP_TICKERS))
     logger.info("  CSP strike   : %.1f%% OTM  |  DTE %d-%d days",
@@ -1098,10 +1167,14 @@ def main() -> None:
                 config.STOP_LOSS_PCT)
     logger.info("  Min hold     : %d day(s)  |  Cooldown : %d hrs after any close",
                 config.MIN_HOLD_DAYS, config.TICKER_COOLDOWN_HRS)
-    logger.info("  VIX gates    : no-trade >= %.0f  |  half-size >= %.0f",
-                config.VIX_NO_TRADE, config.VIX_HALF_SIZE)
+    logger.info("  VIX gates    : no-trade >= %.0f  |  elevated (max %d position) >= %.0f",
+                config.VIX_NO_TRADE, config.VIX_ELEVATED_MAX_POSITIONS, config.VIX_ELEVATED)
     logger.info("  Trade log    : %s", config.TRADE_LOG_FILE)
     logger.info("=" * 70)
+
+    # Drop any cooldowns left over for tickers no longer in the watchlists
+    # (e.g. AMZN after it was replaced by SPY/QQQ).
+    _prune_stale_cooldowns()
 
     # Run one cycle immediately on startup so we don't wait CHECK_INTERVAL_MIN
     run_cycle()
