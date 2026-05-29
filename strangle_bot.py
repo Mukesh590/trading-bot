@@ -1309,23 +1309,29 @@ def run_cycle() -> None:
         logger.debug("Market closed — no action this cycle")
         return
 
-    # Refresh the live position count FIRST so the cap check reflects any
-    # positions that survived a restart and aren't yet in memory.
+    # Refresh live count and fetch VIX up front so the cycle-start header
+    # shows the accurate combined count against the VIX-adjusted cap
+    # (not a hardcoded config value).
     _refresh_live_position_count()
+    vix = market_data.get_vix_level()
+    position_cap = (
+        config.VIX_ELEVATED_MAX_POSITIONS
+        if vix is not None and vix >= config.VIX_ELEVATED
+        else config.MAX_STRANGLES
+    )
 
     mins_left = market_data.minutes_to_close()
     logger.info(
         "=== Strategy cycle  (%d min to close | "
-        "CCS=%d/%d  CSP=%d  CC=%d  assigned=%d) ===",
+        "CCS+CSP=%d/%d (CCS=%d CSP=%d)  CC=%d  assigned=%d) ===",
         mins_left,
-        len(open_strangles), config.MAX_STRANGLES,
-        len(open_csps),
+        _capped_open_positions(), position_cap,
+        len(open_strangles), len(open_csps),
         len(open_covered_calls),
         len(assigned_shares),
     )
 
     # ── VIX gate ───────────────────────────────────────────────────────────────
-    vix = market_data.get_vix_level()
     if vix is None:
         logger.warning("VIX unavailable — managing existing positions only this cycle")
         manage_positions()
@@ -1381,13 +1387,10 @@ def run_cycle() -> None:
     # < VIX_NO_TRADE) we allow only VIX_ELEVATED_MAX_POSITIONS open at once — one
     # position, full size — rather than trading reduced contract counts.
     if vix >= config.VIX_ELEVATED:
-        position_cap = config.VIX_ELEVATED_MAX_POSITIONS
         logger.info(
             "VIX %.2f >= elevated threshold (%.0f) — capping open CCS+CSP positions at %d",
             vix, config.VIX_ELEVATED, position_cap,
         )
-    else:
-        position_cap = config.MAX_STRANGLES
 
     def _at_capacity() -> bool:
         """True when no further CCS/CSP positions may be opened this cycle."""
