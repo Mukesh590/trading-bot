@@ -5,36 +5,42 @@ Edit values here to tune the strategy. Trading logic modules import from
 this file — no magic numbers should appear anywhere else in the codebase.
 
 Academic basis for key parameters (papers in project root):
+  [TRAINOR2024]  ssrn-5218644  – Trainor & Traian, "Mitigating Loss Trauma: Cash-Secured
+                                  Puts" (J. of Investment Consulting, Vol 23 No 1, 2024).
+                                  SPX/SPY data Jan 1990–Mar 2023, N=389 months.  Direct
+                                  CSP study (not a CC proxy).
   [FOLTICE2021]  ssrn-3786342  – Foltice, "Revisiting Covered Calls and Protective Puts"
                                   SPY data 1993-2020, N=331 months.  By put-call parity,
-                                  CC at X% OTM ≡ CSP at X% OTM.
+                                  CC at X% OTM ≡ CSP at X% OTM — secondary CSP source.
   [ISRAELOV2014] ssrn-2444993  – Israelov & Nielsen, "Covered Call Strategies: One Fact
                                   and Eight Myths" (AQR, 2014).
   [ISRAELOV2015] ssrn-2444999  – Israelov & Nielsen, "Covered Calls Uncovered"
                                   (FAJ Nov/Dec 2015, AQR).
   [WRONG PAPER]  ssrn-191668   – Collin-Dufresne, Goldstein & Martin (1999),
                                   "Determinants of Credit Spread Changes" — a fixed-income
-                                  paper about corporate bond credit spreads.  It has NO
-                                  findings applicable to equity options or CSP strike
-                                  selection.  If you intended a CSP-specific study here,
-                                  replace this file.
+                                  paper about corporate bond credit spreads with NO findings
+                                  applicable to equity options.
 
 Theoretical performance expectations (from academic evidence):
-  Win rate (positive monthly P&L) at 3% OTM:  ~71% per month   [FOLTICE2021, Exhibit 1]
-  CAPM alpha above buy-and-hold:               ~0.59%/month     [FOLTICE2021, Exhibit 1]
-  Short-volatility component Sharpe ratio:      ~1.0 annualised  [ISRAELOV2015, Table 1]
-  Expected annual alpha vs passive equity:      ~7%              [FOLTICE2021]
+  CSP 2.5% OTM annual Sharpe:                 0.44 (vs 0.41 B&H) [TRAINOR2024, Table 1]
+  CSP 2.5% OTM avg annual return:             8.9% rolling / 9.8% non-overlapping
+                                                                   [TRAINOR2024, Tables 1&2]
+  CSP 2.5% OTM assignment probability/yr:     84%                 [TRAINOR2024]
+  CSP 2.5% OTM Sharpe in down markets:        0.39 (vs SPY 0.29)  [TRAINOR2024, Table 3A]
+  Short-volatility component Sharpe ratio:     ~1.0 annualised     [ISRAELOV2015, Table 1]
+  CC CAPM alpha above buy-and-hold:           ~0.59%/month (3% OTM)[FOLTICE2021, Exhibit 1]
 
 Strategy contradictions vs academic literature (do not fix silently):
   1. CC_MIN/MAX_DTE (weekly 5-9 DTE): Myth 4 in [ISRAELOV2014] explicitly states that
      shorter-dated options produce higher cash flow but NOT higher risk-adjusted returns.
-     Papers validate only 30-DTE monthly options.  Updated to 25-35 DTE below.
-  2. VIX gates reduce trading when VIX is high: [ISRAELOV2015] Table 5 shows the short-
-     volatility Sharpe ratio is ~1.0 across all regimes, including the bear period
-     2002-2008.  High VIX means richer options → BETTER selling environment for index
-     options.  Individual stocks add gap/earnings risk, so VIX_NO_TRADE=40 is retained
-     as a backstop, but VIX_ELEVATED lowered from 30 → 25.
-  3. ssrn-191668 (credit spread paper): Contains no usable CSP parameters.
+     Both [ISRAELOV2014] and [TRAINOR2024] validate only monthly (~30-DTE) options.
+     Quarterly options explicitly rejected by [TRAINOR2024]: "little evidence to support
+     using three-month options."  Updated to 25-35 DTE below.
+  2. VIX gates reduce trading when VIX is high: [ISRAELOV2015] Table 5 shows short-vol
+     Sharpe ~1.0 across all regimes including 2002-2008 bear.  High VIX = richer options.
+     Individual stocks add gap/earnings risk, so VIX_NO_TRADE=40 retained as backstop,
+     but VIX_ELEVATED lowered from 30 → 25.
+  3. ssrn-191668 (credit spread paper): Contains no usable options parameters.
 """
 
 # ── Watchlists ─────────────────────────────────────────────────────────────────
@@ -114,12 +120,21 @@ MIN_HOLD_DAYS = 1
 TICKER_COOLDOWN_HRS = 24
 
 # ── Cash-secured put construction (CSP_TICKERS — wheel strategy) ───────────────
-# [FOLTICE2021] Exhibit 1: 3% OTM CC (≡ 3% OTM CSP by put-call parity) produces
-# the highest statistically significant CAPM alpha (0.59%/month, p<0.01) over 331
-# months and the highest Sharpe after transaction costs.  5% OTM alpha is only
-# 0.49%/month (p<0.05, barely significant) and falls further post-transaction costs.
-# Trade-off: 3% OTM means more frequent assignment — acceptable for the wheel.
-CSP_OTM_PCT = 0.03          # Sell put 3 % below spot  [was 0.05; see FOLTICE2021]
+# [TRAINOR2024] Table 1 (Jan 1990–Mar 2023, N=389): 2.5% OTM CSP is the clear winner
+# across all risk-adjusted metrics:
+#   Sharpe  0.44  vs  5% OTM 0.33 / 10% OTM 0.30 / SPY 0.41
+#   Sortino 1.17  vs  5% OTM 0.98 / 10% OTM 1.10 / SPY 1.12
+#   Avg annual return 8.9% — exceeds both deeper OTM strategies
+# [TRAINOR2024] Table 2 (non-overlapping annual): 2.5% OTM geometric return 8.7%
+#   beats buy-and-hold geometric 8.0% over 33 independent years.
+# [TRAINOR2024]: 84% probability of assignment within 1 year at 2.5% OTM — critical
+#   for the wheel; deeper OTM puts are rarely exercised (5%→56%, 10%→27%).
+# [TRAINOR2024]: "In terms of Sharpe and Sortino ratios, the 2.5-percent secured-put
+#   strategy provides the best risk/reward combination, slightly better than buy-and-hold."
+# DTE: monthly (~30 DTE), third Friday.  Quarterly options explicitly rejected by paper.
+# [FOLTICE2021] CC proxy also supports ≈2-3% OTM as the optimal zone; 2.5% sits at
+#   the upper end of Foltice's best-alpha range (2-3% OTM, α=0.59%/month, p<0.01).
+CSP_OTM_PCT = 0.025         # Sell put 2.5 % below spot  [was 0.03; TRAINOR2024 Table 1]
 
 # ── Covered call construction (only after CSP assignment) ──────────────────────
 # Strike: [ISRAELOV2014] Exhibit 4 shows ATM provides the highest volatility risk
