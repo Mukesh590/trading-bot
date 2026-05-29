@@ -53,7 +53,9 @@ Strategy contradictions vs academic literature (do not fix silently):
 # deeper, tighter options chains that work with our account level.  Their
 # percentage-based strike selection (see options_helper) is price-agnostic, so
 # the same OTM % and spread-width rules apply cleanly to ETF prices.
-CCS_TICKERS = ['META', 'SPY', 'QQQ']
+# META removed: consistently loses on CCS — individual stock jump risk and
+# high premium relative to the defined-risk spread structure erodes edge.
+CCS_TICKERS = ['SPY', 'QQQ']
 CSP_TICKERS = ['MSFT', 'AAPL']
 WATCH_LIST  = CCS_TICKERS + CSP_TICKERS   # kept for logging convenience
 

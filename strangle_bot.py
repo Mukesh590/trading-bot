@@ -7,7 +7,7 @@ level is reached.
 
 Strategy rules
 --------------
-  Tickers        : CCS on META, SPY, QQQ;  CSP/wheel on MSFT, AAPL
+  Tickers        : CCS on SPY, QQQ;  CSP/wheel on MSFT, AAPL
   Call leg       : Sell call ≈ 2.5 % above spot; buy call ≈ CALL_SPREAD_WIDTH_DOLLARS
                    higher on the same expiry to cap upside risk (credit spread)
   Put  leg       : Sell put  ≈ 2.5 % below current spot (cash-secured); opens
@@ -35,6 +35,7 @@ Known limitation
   automatically managed on the next start — close them manually in Alpaca.
 """
 
+import csv
 import logging
 import os
 import sys
@@ -173,9 +174,9 @@ def _live_short_position_count() -> int:
     (3-4 chars), sym[:-15] reliably extracts the underlying.
 
     Buckets:
-      CCS tickers  (META/SPY/QQQ): any short option counts as one strangle slot.
-      CSP tickers  (MSFT/AAPL):    only short PUTS count (short calls = covered
-                                   call, which is exempt from the cap).
+      CCS tickers  (SPY/QQQ):   any short option counts as one strangle slot.
+      CSP tickers  (MSFT/AAPL): only short PUTS count (short calls = covered
+                                call, which is exempt from the cap).
     """
     try:
         positions = trading_client.get_all_positions()
@@ -631,6 +632,78 @@ def _close_strangle(
     )
 
     del open_strangles[sid]
+
+
+# ── P&L dashboard ─────────────────────────────────────────────────────────────
+
+def _log_pnl_summary() -> None:
+    """
+    Log a performance overview broken into realized, unrealized, and total P&L.
+
+    REALIZED   — sum of all pnl values from CLOSE rows in the trade log.
+    UNREALIZED — for each open position: entry credit minus current market price,
+                 multiplied by contracts * 100.  A positive number means the
+                 option has lost value since we sold it (a paper gain).
+    TOTAL      — realized + unrealized.
+
+    Called at the end of each manage cycle so the numbers reflect any closes
+    that just happened and the fresh prices from this cycle's API calls.
+    """
+    # ── Realized P&L from trade log ───────────────────────────────────────────
+    realized = 0.0
+    if os.path.exists(config.TRADE_LOG_FILE):
+        try:
+            with open(config.TRADE_LOG_FILE, 'r', newline='') as fh:
+                for row in csv.DictReader(fh):
+                    if row.get('action') == 'CLOSE' and row.get('pnl'):
+                        try:
+                            realized += float(row['pnl'])
+                        except ValueError:
+                            pass
+        except Exception as exc:
+            logger.warning("Could not read trade log for P&L summary: %s", exc)
+
+    # ── Unrealized P&L from open positions ────────────────────────────────────
+    unrealized = 0.0
+    pricing_failures = 0
+
+    for s in open_strangles.values():
+        sc = options_helper.get_option_midprice(s['short_call_symbol'], option_data_client)
+        lc = options_helper.get_option_midprice(s['long_call_symbol'],  option_data_client)
+        if sc is None or lc is None:
+            pricing_failures += 1
+        else:
+            spread_now = max(sc - lc, 0.0)
+            unrealized += (s['call_spread_credit'] - spread_now) * s['contracts'] * 100
+        if s['put_symbol'] is not None:
+            pp = options_helper.get_option_midprice(s['put_symbol'], option_data_client)
+            if pp is None:
+                pricing_failures += 1
+            else:
+                unrealized += (s['put_credit'] - pp) * s['contracts'] * 100
+
+    for s in open_csps.values():
+        pp = options_helper.get_option_midprice(s['put_symbol'], option_data_client)
+        if pp is None:
+            pricing_failures += 1
+        else:
+            unrealized += (s['put_credit'] - pp) * s['contracts'] * 100
+
+    for s in open_covered_calls.values():
+        cp = options_helper.get_option_midprice(s['call_symbol'], option_data_client)
+        if cp is None:
+            pricing_failures += 1
+        else:
+            unrealized += (s['call_credit'] - cp) * s['contracts'] * 100
+
+    total = realized + unrealized
+    caveat = f"  ({pricing_failures} leg(s) unpriced)" if pricing_failures else ""
+
+    logger.info("──── P&L Summary ──────────────────────────────────────────────────────")
+    logger.info("  REALIZED   (closed trades):         $%+.2f", realized)
+    logger.info("  UNREALIZED (open positions, mark):  $%+.2f%s", unrealized, caveat)
+    logger.info("  TOTAL P&L:                          $%+.2f", total)
+    logger.info("───────────────────────────────────────────────────────────────────────")
 
 
 # ── Position management ────────────────────────────────────────────────────────
@@ -1225,7 +1298,7 @@ def run_cycle() -> None:
       5. Backfill the put leg on any spread-only strangles whose put was skipped
          at open for lack of buying power (not gated by the cap — completes an
          existing position rather than opening a new one).
-      6. Open new CCS (META/SPY/QQQ) then CSPs (MSFT/AAPL) while the capped
+      6. Open new CCS (SPY/QQQ) then CSPs (MSFT/AAPL) while the capped
          open-position count (CCS + CSP) stays under the cap.  The cap is
          MAX_STRANGLES normally, or VIX_ELEVATED_MAX_POSITIONS when VIX is
          elevated (>= VIX_ELEVATED).
@@ -1258,6 +1331,7 @@ def run_cycle() -> None:
         manage_positions()
         manage_csps()
         manage_covered_calls()
+        _log_pnl_summary()
         return
 
     logger.info("VIX = %.2f", vix)
@@ -1276,11 +1350,13 @@ def run_cycle() -> None:
         manage_positions()
         manage_csps()
         manage_covered_calls()
+        _log_pnl_summary()
         return
 
     manage_positions()
     manage_csps()
     manage_covered_calls()
+    _log_pnl_summary()
 
     # ── Stop opening new positions near market close ────────────────────────────
     if mins_left <= config.CLOSE_BUFFER_MIN:
@@ -1324,7 +1400,7 @@ def run_cycle() -> None:
             return True
         return False
 
-    # ── New CCS strangles (META, SPY, QQQ) ────────────────────────────────────
+    # ── New CCS strangles (SPY, QQQ) ──────────────────────────────────────────
     for ticker in config.CCS_TICKERS:
         if _at_capacity():
             break
