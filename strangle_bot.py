@@ -158,6 +158,64 @@ def _get_buying_power() -> float:
         return 0.0
 
 
+# Live position count — refreshed once per cycle via _refresh_live_position_count().
+# Used so a restart with existing Alpaca positions doesn't zero-out the cap check.
+_cycle_live_position_count: int = 0
+
+
+def _live_short_position_count() -> int:
+    """
+    Count distinct underlying tickers that have live SHORT option positions in
+    Alpaca, split by strategy bucket so covered calls are correctly excluded.
+
+    OCC option symbols end with YYMMDD(6) + C/P(1) + 8-digit-strike(8) = 15 chars.
+    The leading chars are the underlying ticker.  For all tickers in this bot
+    (3-4 chars), sym[:-15] reliably extracts the underlying.
+
+    Buckets:
+      CCS tickers  (META/SPY/QQQ): any short option counts as one strangle slot.
+      CSP tickers  (MSFT/AAPL):    only short PUTS count (short calls = covered
+                                   call, which is exempt from the cap).
+    """
+    try:
+        positions = trading_client.get_all_positions()
+        ccs_with_short: set = set()
+        csp_with_short_put: set = set()
+        for pos in positions:
+            sym = pos.symbol
+            qty = float(pos.qty)
+            if len(sym) <= 15 or qty >= 0:
+                continue  # stock position or long option — skip
+            underlying   = sym[:-15]
+            option_type  = sym[-9].upper()   # 'C' or 'P'
+            if underlying in config.CCS_TICKERS:
+                ccs_with_short.add(underlying)
+            elif underlying in config.CSP_TICKERS and option_type == 'P':
+                csp_with_short_put.add(underlying)
+        return len(ccs_with_short) + len(csp_with_short_put)
+    except Exception as exc:
+        logger.error("Live position count failed: %s", exc)
+        return 0
+
+
+def _refresh_live_position_count() -> None:
+    """
+    Query Alpaca for the current live short-option count and cache it for this
+    cycle.  Called once at the start of every run_cycle() so the cap check is
+    accurate even after a restart that wiped the in-memory tracker.
+    """
+    global _cycle_live_position_count
+    live = _live_short_position_count()
+    in_mem = len(open_strangles) + len(open_csps)
+    if live > in_mem:
+        logger.warning(
+            "Live Alpaca short-option count (%d) exceeds in-memory count (%d) — "
+            "positions exist from a previous session; using live count for cap",
+            live, in_mem,
+        )
+    _cycle_live_position_count = live
+
+
 def _capped_open_positions() -> int:
     """
     Number of open positions that count toward the MAX_STRANGLES capacity check:
@@ -165,11 +223,12 @@ def _capped_open_positions() -> int:
 
     Covered calls are deliberately EXCLUDED — they are written against shares we
     were already assigned and must always be monetised, regardless of how many
-    CCS/CSP positions are open.  So, e.g., two CSPs on MSFT/AAPL plus one CCS
-    fills all three slots and no fourth CCS/CSP can open, but a covered call on
-    assigned shares may still be written.
+    CCS/CSP positions are open.
+
+    The live count from _refresh_live_position_count() ensures this is accurate
+    even after a restart that wiped open_strangles / open_csps to zero.
     """
-    return len(open_strangles) + len(open_csps)
+    return max(len(open_strangles) + len(open_csps), _cycle_live_position_count)
 
 
 def _prune_stale_cooldowns() -> None:
@@ -1176,6 +1235,10 @@ def run_cycle() -> None:
     if not market_data.is_market_open():
         logger.debug("Market closed — no action this cycle")
         return
+
+    # Refresh the live position count FIRST so the cap check reflects any
+    # positions that survived a restart and aren't yet in memory.
+    _refresh_live_position_count()
 
     mins_left = market_data.minutes_to_close()
     logger.info(

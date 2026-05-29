@@ -39,19 +39,34 @@ def _fetch_chain(
     min_exp: date,
     max_exp: date,
     trading_client: TradingClient,
+    min_strike: Optional[float] = None,
+    max_strike: Optional[float] = None,
 ) -> List:
     """
     Return a list of active option contracts for one side of the chain.
 
+    min_strike / max_strike narrow the search to a dollar window around the
+    target strike.  Without these filters the Alpaca API returns the first N
+    contracts sorted by strike ascending.  For high-priced ETFs (SPY ~$590,
+    QQQ ~$510) this can mean the 2.5%-OTM short call target (~$605) falls
+    outside the returned page — the bot then selects the highest available
+    strike as "nearest," which may be $20-30 below spot rather than above.
+
     Handles both list and response-object return types across alpaca-py versions.
     """
-    req = GetOptionContractsRequest(
+    kwargs: dict = dict(
         underlying_symbols=[ticker],
         expiration_date_gte=min_exp,
         expiration_date_lte=max_exp,
         type=contract_type,
         status='active',
     )
+    if min_strike is not None:
+        kwargs['strike_price_gte'] = str(round(min_strike, 2))
+    if max_strike is not None:
+        kwargs['strike_price_lte'] = str(round(max_strike, 2))
+
+    req = GetOptionContractsRequest(**kwargs)
     resp = trading_client.get_option_contracts(req)
 
     # alpaca-py may wrap results in a response object or return them directly
@@ -113,14 +128,28 @@ def find_strangle_contracts(
     put_target  = round(current_price * (1 - config.PUT_OTM_PCT),  2)
     min_exp, max_exp = _expiry_window()
 
+    # Strike search windows — keep the API query tight so the correct strikes
+    # are always within the returned page even for high-priced ETFs.
+    buf = config.STRIKE_SEARCH_BUFFER
+    call_min = call_target - buf
+    call_max = call_target + config.CALL_SPREAD_WIDTH_DOLLARS + buf
+    put_min  = put_target  - buf
+    put_max  = put_target  + buf
+
     logger.info(
-        "%s  spot=%.2f  short_call_target=%.2f  put_target=%.2f  exp=[%s -> %s]",
-        ticker, current_price, call_target, put_target, min_exp, max_exp,
+        "%s  spot=%.2f  short_call_target=%.2f [%.2f-%.2f]  "
+        "put_target=%.2f [%.2f-%.2f]  exp=[%s -> %s]",
+        ticker, current_price,
+        call_target, call_min, call_max,
+        put_target,  put_min,  put_max,
+        min_exp, max_exp,
     )
 
     try:
-        calls = _fetch_chain(ticker, 'call', min_exp, max_exp, trading_client)
-        puts  = _fetch_chain(ticker, 'put',  min_exp, max_exp, trading_client)
+        calls = _fetch_chain(ticker, 'call', min_exp, max_exp, trading_client,
+                             min_strike=call_min, max_strike=call_max)
+        puts  = _fetch_chain(ticker, 'put',  min_exp, max_exp, trading_client,
+                             min_strike=put_min,  max_strike=put_max)
     except Exception as exc:
         logger.error("Contract fetch failed for %s: %s", ticker, exc)
         return None
@@ -173,14 +202,17 @@ def find_csp_contract(
     """
     put_target = round(current_price * (1 - config.CSP_OTM_PCT), 2)
     min_exp, max_exp = _expiry_window()
+    buf = config.STRIKE_SEARCH_BUFFER
 
     logger.info(
-        "%s CSP: spot=%.2f  put_target=%.2f  exp=[%s -> %s]",
-        ticker, current_price, put_target, min_exp, max_exp,
+        "%s CSP: spot=%.2f  put_target=%.2f [%.2f-%.2f]  exp=[%s -> %s]",
+        ticker, current_price, put_target,
+        put_target - buf, put_target + buf, min_exp, max_exp,
     )
 
     try:
-        puts = _fetch_chain(ticker, 'put', min_exp, max_exp, trading_client)
+        puts = _fetch_chain(ticker, 'put', min_exp, max_exp, trading_client,
+                            min_strike=put_target - buf, max_strike=put_target + buf)
     except Exception as exc:
         logger.error("CSP chain fetch failed for %s: %s", ticker, exc)
         return None
@@ -212,14 +244,17 @@ def find_put_for_expiry(
     """
     put_target = round(current_price * (1 - config.PUT_OTM_PCT), 2)
     exp_date = expiry if isinstance(expiry, date) else date.fromisoformat(str(expiry))
+    buf = config.STRIKE_SEARCH_BUFFER
 
     logger.info(
-        "%s PUT backfill: spot=%.2f  put_target=%.2f  exp=%s",
-        ticker, current_price, put_target, exp_date,
+        "%s PUT backfill: spot=%.2f  put_target=%.2f [%.2f-%.2f]  exp=%s",
+        ticker, current_price, put_target,
+        put_target - buf, put_target + buf, exp_date,
     )
 
     try:
-        puts = _fetch_chain(ticker, 'put', exp_date, exp_date, trading_client)
+        puts = _fetch_chain(ticker, 'put', exp_date, exp_date, trading_client,
+                            min_strike=put_target - buf, max_strike=put_target + buf)
     except Exception as exc:
         logger.error("Put backfill chain fetch failed for %s: %s", ticker, exc)
         return None
@@ -263,6 +298,7 @@ def find_covered_call_contract(
     call_target  = round(current_price * (1 + config.CC_OTM_PCT_MAX), 2)
     call_min_otm = round(current_price * (1 + config.CC_OTM_PCT_MIN), 2)
     min_exp, max_exp = _cc_expiry_window()
+    buf = config.STRIKE_SEARCH_BUFFER
 
     # The strike must clear both the OTM floor and the cost-basis floor.
     min_eligible_strike = max(call_min_otm, cost_basis)
@@ -275,7 +311,9 @@ def find_covered_call_contract(
     )
 
     try:
-        calls = _fetch_chain(ticker, 'call', min_exp, max_exp, trading_client)
+        calls = _fetch_chain(ticker, 'call', min_exp, max_exp, trading_client,
+                             min_strike=min_eligible_strike - buf,
+                             max_strike=call_target + buf)
     except Exception as exc:
         logger.error("CC chain fetch failed for %s: %s", ticker, exc)
         return None

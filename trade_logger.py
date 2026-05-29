@@ -49,10 +49,14 @@ _FIELDS = [
 # Map a leg label to its strategy structure, used both for new rows when a
 # caller omits position_type and to back-fill the column when migrating an
 # older log that predates it.
+# 'CALL' covers versions that logged the call side as a single unlabelled row
+# before the SHORT_CALL / LONG_CALL split.  This bot never has naked calls, so
+# any standalone 'CALL' row is always part of a credit spread.
 _LEG_TO_POSITION_TYPE = {
     'CALL_SPREAD': 'CALL_CREDIT_SPREAD',   # legacy single-row call spread
     'SHORT_CALL':  'CALL_CREDIT_SPREAD',
     'LONG_CALL':   'CALL_CREDIT_SPREAD',
+    'CALL':        'CALL_CREDIT_SPREAD',   # legacy: any call in this bot is a CCS
     'PUT':         'CASH_SECURED_PUT',
     'CSP':         'CASH_SECURED_PUT',
     'CC':          'COVERED_CALL',

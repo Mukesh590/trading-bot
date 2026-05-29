@@ -115,6 +115,16 @@ NORMAL_CONTRACTS  = 2   # Standard qty per leg
 CHECK_INTERVAL_MIN  = 30   # Run the main strategy loop every N minutes
 CLOSE_BUFFER_MIN    = 30   # Stop opening new strangles this many minutes before 4 PM close
 
+# ── Strike search window ───────────────────────────────────────────────────────
+# Dollar buffer around each target strike when querying the Alpaca options chain.
+# The API returns a paginated, bounded set of contracts.  Without a strike filter,
+# high-priced ETFs (SPY, QQQ) return only the lower portion of the chain — so the
+# bot finds a strike near $584 instead of the 2.5%-OTM target near $605.
+# Setting this to $15 covers the search from (target-15) to (target+width+15),
+# which captures the short AND long legs for $1-spaced ETF chains while staying
+# well inside the page limit.
+STRIKE_SEARCH_BUFFER = 15
+
 # ── Output files ───────────────────────────────────────────────────────────────
 TRADE_LOG_FILE = 'trades.csv'    # CSV file for all trade records
 BOT_LOG_FILE   = 'bot.log'       # Rotating text log for debugging
