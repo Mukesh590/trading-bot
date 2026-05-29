@@ -699,11 +699,11 @@ def _log_pnl_summary() -> None:
     total = realized + unrealized
     caveat = f"  ({pricing_failures} leg(s) unpriced)" if pricing_failures else ""
 
-    logger.info("──── P&L Summary ──────────────────────────────────────────────────────")
+    logger.info("---- P&L Summary ------------------------------------------------------")
     logger.info("  REALIZED   (closed trades):         $%+.2f", realized)
     logger.info("  UNREALIZED (open positions, mark):  $%+.2f%s", unrealized, caveat)
     logger.info("  TOTAL P&L:                          $%+.2f", total)
-    logger.info("───────────────────────────────────────────────────────────────────────")
+    logger.info("-----------------------------------------------------------------------")
 
 
 # ── Position management ────────────────────────────────────────────────────────
