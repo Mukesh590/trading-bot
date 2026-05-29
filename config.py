@@ -3,6 +3,38 @@ Strategy configuration for the Short Strangle Income Bot.
 
 Edit values here to tune the strategy. Trading logic modules import from
 this file — no magic numbers should appear anywhere else in the codebase.
+
+Academic basis for key parameters (papers in project root):
+  [FOLTICE2021]  ssrn-3786342  – Foltice, "Revisiting Covered Calls and Protective Puts"
+                                  SPY data 1993-2020, N=331 months.  By put-call parity,
+                                  CC at X% OTM ≡ CSP at X% OTM.
+  [ISRAELOV2014] ssrn-2444993  – Israelov & Nielsen, "Covered Call Strategies: One Fact
+                                  and Eight Myths" (AQR, 2014).
+  [ISRAELOV2015] ssrn-2444999  – Israelov & Nielsen, "Covered Calls Uncovered"
+                                  (FAJ Nov/Dec 2015, AQR).
+  [WRONG PAPER]  ssrn-191668   – Collin-Dufresne, Goldstein & Martin (1999),
+                                  "Determinants of Credit Spread Changes" — a fixed-income
+                                  paper about corporate bond credit spreads.  It has NO
+                                  findings applicable to equity options or CSP strike
+                                  selection.  If you intended a CSP-specific study here,
+                                  replace this file.
+
+Theoretical performance expectations (from academic evidence):
+  Win rate (positive monthly P&L) at 3% OTM:  ~71% per month   [FOLTICE2021, Exhibit 1]
+  CAPM alpha above buy-and-hold:               ~0.59%/month     [FOLTICE2021, Exhibit 1]
+  Short-volatility component Sharpe ratio:      ~1.0 annualised  [ISRAELOV2015, Table 1]
+  Expected annual alpha vs passive equity:      ~7%              [FOLTICE2021]
+
+Strategy contradictions vs academic literature (do not fix silently):
+  1. CC_MIN/MAX_DTE (weekly 5-9 DTE): Myth 4 in [ISRAELOV2014] explicitly states that
+     shorter-dated options produce higher cash flow but NOT higher risk-adjusted returns.
+     Papers validate only 30-DTE monthly options.  Updated to 25-35 DTE below.
+  2. VIX gates reduce trading when VIX is high: [ISRAELOV2015] Table 5 shows the short-
+     volatility Sharpe ratio is ~1.0 across all regimes, including the bear period
+     2002-2008.  High VIX means richer options → BETTER selling environment for index
+     options.  Individual stocks add gap/earnings risk, so VIX_NO_TRADE=40 is retained
+     as a backstop, but VIX_ELEVATED lowered from 30 → 25.
+  3. ssrn-191668 (credit spread paper): Contains no usable CSP parameters.
 """
 
 # ── Watchlists ─────────────────────────────────────────────────────────────────
@@ -82,21 +114,42 @@ MIN_HOLD_DAYS = 1
 TICKER_COOLDOWN_HRS = 24
 
 # ── Cash-secured put construction (CSP_TICKERS — wheel strategy) ───────────────
-# Deeper OTM than the strangle put: gives more cushion and lowers the effective
-# cost basis if assigned.
-CSP_OTM_PCT = 0.05          # Sell put 5 % below spot
+# [FOLTICE2021] Exhibit 1: 3% OTM CC (≡ 3% OTM CSP by put-call parity) produces
+# the highest statistically significant CAPM alpha (0.59%/month, p<0.01) over 331
+# months and the highest Sharpe after transaction costs.  5% OTM alpha is only
+# 0.49%/month (p<0.05, barely significant) and falls further post-transaction costs.
+# Trade-off: 3% OTM means more frequent assignment — acceptable for the wheel.
+CSP_OTM_PCT = 0.03          # Sell put 3 % below spot  [was 0.05; see FOLTICE2021]
 
 # ── Covered call construction (only after CSP assignment) ──────────────────────
-CC_OTM_PCT_MIN = 0.03       # Strike must be at least 3 % above current spot
-CC_OTM_PCT_MAX = 0.05       # Target strike ~5 % above current spot
-CC_MIN_DTE     = 5          # Weekly options: at least 5 days to expiration
-CC_MAX_DTE     = 9          # Cap at 9 days to stay in the weekly window
+# Strike: [ISRAELOV2014] Exhibit 4 shows ATM provides the highest volatility risk
+# premium (VRP) per unit of leverage.  [ISRAELOV2015] Table 1 & 3 shows 2% OTM has
+# near-identical short-volatility Sharpe (~1.0) to ATM.  Tightening from 3-5% OTM
+# toward 2-3% OTM captures more VRP while still staying OTM to avoid early call-away.
+# [FOLTICE2021] Exhibit 1: 1-2% OTM has highest Sharpe (0.361).
+#
+# DTE: [ISRAELOV2014] Myth 4: "selling options more often per year [shorter DTE] does
+# NOT unequivocally translate into higher net profits."  Both [ISRAELOV2014] and
+# [ISRAELOV2015] validate only 30-DTE (1-month) options.  Changing from weekly (5-9 DTE)
+# to monthly (25-35 DTE) eliminates uncompensated risk from high-frequency theta rollover.
+CC_OTM_PCT_MIN = 0.02       # Strike at least 2 % above spot  [was 0.03; ISRAELOV2014/2015]
+CC_OTM_PCT_MAX = 0.03       # Target ~3 % above spot           [was 0.05; FOLTICE2021]
+CC_MIN_DTE     = 25         # Monthly options: at least 25 DTE [was 5; ISRAELOV2014 Myth 4]
+CC_MAX_DTE     = 35         # Cap at 35 DTE for monthly window [was 9; ISRAELOV2014]
 
 # ── VIX filters ────────────────────────────────────────────────────────────────
-# High-volatility environments make short premium strategies riskier.
+# Academic nuance: [ISRAELOV2015] Table 5 shows the short-volatility Sharpe ratio is
+# ~1.49 in bull markets and ~0.40 even in the 2002-2008 bear period — always positive.
+# [ISRAELOV2014] conclusion: "a good stand-alone strategy when implied volatilities are
+# high relative to expectations."  High VIX = richer options → BETTER selling environment
+# for index vol.  The literature does NOT support halting selling at elevated VIX.
+#
+# However: the papers study S&P 500 index options.  Individual stocks (MSFT, AAPL, META)
+# carry jump risk from earnings and news.  VIX_NO_TRADE=40 is kept as a tail-risk guard.
+# VIX_ELEVATED is lowered 30→25: [ISRAELOV2015] shows moderate VIX regimes are also
+# profitable — we were leaving premium on the table by being too conservative at 30.
 VIX_NO_TRADE     = 40.0   # Do NOT open new positions when VIX is at or above this level
-VIX_ELEVATED     = 30.0   # When VIX is in [VIX_ELEVATED, VIX_NO_TRADE), cap total open
-                          # positions at VIX_ELEVATED_MAX_POSITIONS (full contract size).
+VIX_ELEVATED     = 25.0   # Cap open positions when VIX ∈ [25, 40)  [was 30; ISRAELOV2015]
 VIX_ELEVATED_MAX_POSITIONS = 1   # Open only ONE position while VIX is elevated, rather
                                  # than trading reduced size across several — simpler logic.
 
