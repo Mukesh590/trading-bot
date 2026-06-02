@@ -89,12 +89,21 @@ MAX_DTE = 45
 # earns worthwhile premium.  Set to 0 to disable the hold-window guard.
 PUT_BACKFILL_MIN_DTE = 21
 
-# Maximum number of open positions at any given time, counted across the two
-# premium-selling entry strategies: call credit spreads (CCS) + cash-secured
-# puts (CSP) combined must never exceed this number.  Covered calls are EXEMPT —
-# they monetise shares we were already assigned and are always written.  Limits
-# capital at risk and keeps margin usage manageable.
+# Maximum number of concurrent open positions (long-term holds, 30-45 DTE),
+# counted across the two premium-selling entry strategies: call credit spreads
+# (CCS) + cash-secured puts (CSP) combined must never exceed this number.
+# Covered calls are EXEMPT — they monetise shares we were already assigned and
+# are always written.  Limits capital at risk and keeps margin usage manageable.
 MAX_STRANGLES = 3
+
+# Maximum number of new CCS/CSP positions that may be OPENED within a single
+# calendar day.  This limit resets at midnight and is INDEPENDENT of
+# MAX_STRANGLES — having 3 long-holds open does not consume intraday slots, and
+# closing an intraday position does not free a slot.  Covered calls are exempt.
+# A position counts as intraday when it opens and closes on the same calendar
+# day.  Prevents overtrading on volatile days where stop-losses fire quickly and
+# the bot would otherwise re-enter tickers repeatedly inside one session.
+MAX_INTRADAY_POSITIONS = 4
 
 # ── Profit / loss management ───────────────────────────────────────────────────
 # Target exit: close when we have captured this fraction of the max profit.

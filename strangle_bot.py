@@ -13,7 +13,8 @@ Strategy rules
   Put  leg       : Sell put  ≈ 2.5 % below current spot (cash-secured); opens
                    independently and is skipped if buying power is insufficient
   DTE window     : 30 – 45 days to expiration
-  Max open       : 3 concurrent CCS + CSP positions (covered calls are exempt)
+  Max open       : 3 concurrent CCS + CSP positions (covered calls are exempt);
+                   4 new positions per calendar day (intraday cap, independent)
   Profit target  : Close when >= 50 % of max profit is captured (up to 70 % ideal)
   Stop loss      : Close entire position if call spread value or put value exceeds
                    entry credit * 1.10
@@ -41,7 +42,7 @@ import os
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import schedule
 from dotenv import load_dotenv
@@ -163,6 +164,12 @@ def _get_buying_power() -> float:
 # Used so a restart with existing Alpaca positions doesn't zero-out the cap check.
 _cycle_live_position_count: int = 0
 
+# Intraday open counter — tracks how many CCS/CSP positions have been opened
+# during the current calendar day.  Resets when the date changes.  Lost on
+# restart (consistent with open_strangles / open_csps), so re-enters from 0.
+_daily_opens_count: int = 0
+_daily_opens_date: Optional[date] = None
+
 
 def _live_short_position_count() -> int:
     """
@@ -230,6 +237,31 @@ def _capped_open_positions() -> int:
     even after a restart that wiped open_strangles / open_csps to zero.
     """
     return max(len(open_strangles) + len(open_csps), _cycle_live_position_count)
+
+
+def _reset_daily_opens_if_new_day() -> None:
+    """Reset the intraday open counter when the calendar date rolls over."""
+    global _daily_opens_count, _daily_opens_date
+    today = date.today()
+    if _daily_opens_date != today:
+        if _daily_opens_date is not None:
+            logger.info(
+                "New trading day (%s) — resetting daily open count (was %d/%d)",
+                today, _daily_opens_count, config.MAX_INTRADAY_POSITIONS,
+            )
+        _daily_opens_count = 0
+        _daily_opens_date = today
+
+
+def _at_intraday_capacity() -> bool:
+    """True when the daily new-position quota has been reached."""
+    if _daily_opens_count >= config.MAX_INTRADAY_POSITIONS:
+        logger.info(
+            "At intraday cap (%d/%d positions opened today) — no new CCS/CSP entries",
+            _daily_opens_count, config.MAX_INTRADAY_POSITIONS,
+        )
+        return True
+    return False
 
 
 def _prune_stale_cooldowns() -> None:
@@ -540,20 +572,27 @@ def open_strangle(ticker: str, vix: float) -> bool:
             position_type='CASH_SECURED_PUT', side='SHORT',
         )
 
+    global _daily_opens_count
+    _daily_opens_count += 1
+
     net_credit_dollars = (call_spread_credit + put_credit) * qty * 100
     if put_opened:
         logger.info(
-            "Opened %s  %s  qty=%d  spread=%s/+%s net=%.2f  put=%s@%.2f  total_credit=$%.2f",
+            "Opened %s  %s  qty=%d  spread=%s/+%s net=%.2f  put=%s@%.2f  total_credit=$%.2f  "
+            "(intraday=%d/%d)",
             sid, ticker, qty,
             short_call.symbol, long_call.symbol, call_spread_credit,
             put_contract.symbol, put_credit, net_credit_dollars,
+            _daily_opens_count, config.MAX_INTRADAY_POSITIONS,
         )
     else:
         logger.info(
-            "Opened %s  %s  qty=%d  spread=%s/+%s net=%.2f  put=SKIPPED  total_credit=$%.2f",
+            "Opened %s  %s  qty=%d  spread=%s/+%s net=%.2f  put=SKIPPED  total_credit=$%.2f  "
+            "(intraday=%d/%d)",
             sid, ticker, qty,
             short_call.symbol, long_call.symbol, call_spread_credit,
             net_credit_dollars,
+            _daily_opens_count, config.MAX_INTRADAY_POSITIONS,
         )
     return True
 
@@ -946,6 +985,9 @@ def open_csp(ticker: str, vix: float) -> bool:
         'collateral_reserved':  actual_required,
     }
 
+    global _daily_opens_count
+    _daily_opens_count += 1
+
     trade_logger.log_trade(
         action='OPEN', ticker=ticker, leg='CSP',
         symbol=put_contract.symbol,
@@ -956,9 +998,10 @@ def open_csp(ticker: str, vix: float) -> bool:
     )
     logger.info(
         "Opened %s  %s  qty=%d  strike=%.2f  credit=%.4f  "
-        "cost_basis=%.4f  collateral=$%.2f",
+        "cost_basis=%.4f  collateral=$%.2f  (intraday=%d/%d)",
         csp_id, ticker, qty, actual_strike, put_credit,
         effective_cost_basis, actual_required,
+        _daily_opens_count, config.MAX_INTRADAY_POSITIONS,
     )
     return True
 
@@ -1309,10 +1352,10 @@ def run_cycle() -> None:
         logger.debug("Market closed — no action this cycle")
         return
 
-    # Refresh live count and fetch VIX up front so the cycle-start header
-    # shows the accurate combined count against the VIX-adjusted cap
-    # (not a hardcoded config value).
+    # Refresh live count, reset daily counter if date rolled, and fetch VIX up
+    # front so the cycle-start header shows accurate counts.
     _refresh_live_position_count()
+    _reset_daily_opens_if_new_day()
     vix = market_data.get_vix_level()
     position_cap = (
         config.VIX_ELEVATED_MAX_POSITIONS
@@ -1323,12 +1366,13 @@ def run_cycle() -> None:
     mins_left = market_data.minutes_to_close()
     logger.info(
         "=== Strategy cycle  (%d min to close | "
-        "CCS+CSP=%d/%d (CCS=%d CSP=%d)  CC=%d  assigned=%d) ===",
+        "CCS+CSP=%d/%d (CCS=%d CSP=%d)  CC=%d  assigned=%d  intraday=%d/%d) ===",
         mins_left,
         _capped_open_positions(), position_cap,
         len(open_strangles), len(open_csps),
         len(open_covered_calls),
         len(assigned_shares),
+        _daily_opens_count, config.MAX_INTRADAY_POSITIONS,
     )
 
     # ── VIX gate ───────────────────────────────────────────────────────────────
@@ -1407,6 +1451,8 @@ def run_cycle() -> None:
     for ticker in config.CCS_TICKERS:
         if _at_capacity():
             break
+        if _at_intraday_capacity():
+            break
         if ticker in tickers_with_strangles:
             logger.info("%s: CCS already open — skipping", ticker)
             continue
@@ -1426,6 +1472,8 @@ def run_cycle() -> None:
     # consumes a slot that a CCS would otherwise use (and vice versa).
     for ticker in config.CSP_TICKERS:
         if _at_capacity():
+            break
+        if _at_intraday_capacity():
             break
         if ticker in tickers_with_csps:
             logger.info("%s: CSP already open — skipping", ticker)
@@ -1456,10 +1504,12 @@ def run_cycle() -> None:
         open_covered_call(ticker)
 
     logger.info(
-        "=== Cycle end | CCS+CSP=%d/%d (CCS=%d CSP=%d)  CC=%d (exempt)  assigned=%d ===",
+        "=== Cycle end | CCS+CSP=%d/%d (CCS=%d CSP=%d)  CC=%d (exempt)  "
+        "assigned=%d  intraday=%d/%d ===",
         _capped_open_positions(), position_cap,
         len(open_strangles), len(open_csps), len(open_covered_calls),
         len(assigned_shares),
+        _daily_opens_count, config.MAX_INTRADAY_POSITIONS,
     )
 
 
@@ -1474,7 +1524,8 @@ def main() -> None:
     logger.info("  Call spread  : Sell %.1f%% OTM; buy ~$%d higher",
                 config.CALL_OTM_PCT * 100, config.CALL_SPREAD_WIDTH_DOLLARS)
     logger.info("  Put leg      : Sell %.1f%% OTM", config.PUT_OTM_PCT * 100)
-    logger.info("  Max open     : %d (CCS + CSP combined; covered calls exempt)", config.MAX_STRANGLES)
+    logger.info("  Max open     : %d concurrent (CCS + CSP; covered calls exempt)", config.MAX_STRANGLES)
+    logger.info("  Intraday cap : %d new positions per calendar day (independent of concurrent cap)", config.MAX_INTRADAY_POSITIONS)
     logger.info("  --- Cash-Secured Put + Wheel strategy (CSP) ---")
     logger.info("  Tickers      : %s", ', '.join(config.CSP_TICKERS))
     logger.info("  CSP strike   : %.1f%% OTM  |  DTE %d-%d days",
